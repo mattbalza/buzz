@@ -4182,9 +4182,44 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                     });
                 }
             }
+            append_allowlisted_mcp_env(&mut env);
             env
         },
     }]
+}
+
+/// Forward only operator-selected process environment variables to a stdio MCP
+/// child. ACP's `session/new` environment is intentionally explicit, so MCP
+/// credentials and mode selectors must be opted in by name instead of inheriting
+/// the agent bridge's complete environment.
+fn append_allowlisted_mcp_env(env: &mut Vec<EnvVar>) {
+    let Ok(raw_names) = std::env::var("BUZZ_ACP_MCP_ENV_VARS") else {
+        return;
+    };
+
+    for raw_name in raw_names.split(',') {
+        let name = raw_name.trim();
+        let valid = !name.is_empty()
+            && name.bytes().enumerate().all(|(index, byte)| match byte {
+                b'A'..=b'Z' | b'_' => true,
+                b'0'..=b'9' => index > 0,
+                _ => false,
+            });
+        if !valid {
+            tracing::warn!("ignoring invalid BUZZ_ACP_MCP_ENV_VARS entry");
+            continue;
+        }
+        if env.iter().any(|entry| entry.name == name) {
+            continue;
+        }
+        match std::env::var(name) {
+            Ok(value) => env.push(EnvVar {
+                name: name.to_string(),
+                value,
+            }),
+            Err(_) => tracing::warn!(name, "allowlisted MCP environment variable is unset"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5041,6 +5076,63 @@ mod build_mcp_servers_tests {
         let server = &servers[0];
         let has_auth_tag = server.env.iter().any(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(!has_auth_tag, "empty BUZZ_AUTH_TAG should not be forwarded");
+    }
+
+    #[test]
+    fn session_new_mcp_server_forwards_only_allowlisted_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(
+            "BUZZ_ACP_MCP_ENV_VARS",
+            "ERP_CONNECTOR_KEY_FILE,ERP_MCP_ACCESS_MODE",
+        );
+        std::env::set_var("ERP_CONNECTOR_KEY_FILE", "/run/keys/erp");
+        std::env::set_var("ERP_MCP_ACCESS_MODE", "read-only");
+        std::env::set_var("UNRELATED_SECRET", "must-not-leak");
+
+        let servers = build_mcp_servers(&test_config());
+
+        std::env::remove_var("BUZZ_ACP_MCP_ENV_VARS");
+        std::env::remove_var("ERP_CONNECTOR_KEY_FILE");
+        std::env::remove_var("ERP_MCP_ACCESS_MODE");
+        std::env::remove_var("UNRELATED_SECRET");
+
+        let server = &servers[0];
+        assert!(server.env.iter().any(|entry| {
+            entry.name == "ERP_CONNECTOR_KEY_FILE" && entry.value == "/run/keys/erp"
+        }));
+        assert!(server
+            .env
+            .iter()
+            .any(|entry| { entry.name == "ERP_MCP_ACCESS_MODE" && entry.value == "read-only" }));
+        assert!(!server
+            .env
+            .iter()
+            .any(|entry| entry.name == "UNRELATED_SECRET"));
+    }
+
+    #[test]
+    fn session_new_mcp_server_rejects_invalid_allowlist_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(
+            "BUZZ_ACP_MCP_ENV_VARS",
+            "VALID_NAME,../../etc/passwd,NAME=VALUE,lowercase",
+        );
+        std::env::set_var("VALID_NAME", "forwarded");
+
+        let servers = build_mcp_servers(&test_config());
+
+        std::env::remove_var("BUZZ_ACP_MCP_ENV_VARS");
+        std::env::remove_var("VALID_NAME");
+
+        let names: Vec<&str> = servers[0]
+            .env
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(names.contains(&"VALID_NAME"));
+        assert!(!names.contains(&"../../etc/passwd"));
+        assert!(!names.contains(&"NAME=VALUE"));
+        assert!(!names.contains(&"lowercase"));
     }
 
     #[test]
