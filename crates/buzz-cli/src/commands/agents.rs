@@ -7,10 +7,120 @@ use crate::agent_management::{build_create, build_update, CreateAgentDraft, Upda
 use crate::client::BuzzClient;
 use crate::error::CliError;
 use crate::validate::{read_or_stdin, validate_hex64};
-use crate::{AgentsCmd, RespondToArg};
+use crate::{AgentsCmd, ChannelAddPolicyArg, ReasoningEffortArg, RespondToArg};
+
+struct ProfileDraft<'a> {
+    display_name: &'a str,
+    agent_type: &'a str,
+    model: &'a str,
+    reasoning_effort: ReasoningEffortArg,
+    respond_to: RespondToArg,
+    channel_add_policy: ChannelAddPolicyArg,
+    description: Option<&'a str>,
+    capabilities: &'a [&'a str],
+}
+
+fn validate_profile_text(field: &str, value: &str, max_chars: usize) -> Result<String, CliError> {
+    let normalized = value.trim();
+    if normalized.is_empty() || normalized.chars().count() > max_chars {
+        return Err(CliError::Usage(format!(
+            "--{field} must contain between 1 and {max_chars} characters"
+        )));
+    }
+    if normalized.chars().any(char::is_control) {
+        return Err(CliError::Usage(format!(
+            "--{field} must not contain control characters"
+        )));
+    }
+    Ok(normalized.to_string())
+}
+
+fn validate_profile_slug(field: &str, value: &str) -> Result<String, CliError> {
+    let normalized = validate_profile_text(field, value, 64)?;
+    if !normalized.chars().all(|character| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '-' | '_')
+    }) {
+        return Err(CliError::Usage(format!(
+            "--{field} must be a lowercase ASCII slug"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn build_profile_content(draft: ProfileDraft<'_>) -> Result<serde_json::Value, CliError> {
+    let display_name = validate_profile_text("display-name", draft.display_name, 80)?;
+    let agent_type = validate_profile_slug("agent-type", draft.agent_type)?;
+    let model = validate_profile_text("model", draft.model, 128)?;
+    let description = draft
+        .description
+        .map(|value| validate_profile_text("description", value, 500))
+        .transpose()?;
+    let capabilities = draft
+        .capabilities
+        .iter()
+        .map(|value| validate_profile_slug("capability", value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(json!({
+        "name": display_name,
+        "display_name": display_name,
+        "agent_type": agent_type,
+        "model": model,
+        "reasoning_effort": draft.reasoning_effort.to_wire(),
+        "respond_to": draft.respond_to.to_wire(),
+        "respond_to_allowlist": [],
+        "channel_add_policy": draft.channel_add_policy.to_wire(),
+        "description": description,
+        "channels": [],
+        "channel_ids": [],
+        "capabilities": capabilities,
+        "status": "online",
+    }))
+}
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::PublishProfile {
+            display_name,
+            agent_type,
+            model,
+            reasoning_effort,
+            respond_to,
+            channel_add_policy,
+            description,
+            capabilities,
+        } => {
+            let capability_refs: Vec<&str> = capabilities.iter().map(String::as_str).collect();
+            let content = build_profile_content(ProfileDraft {
+                display_name: &display_name,
+                agent_type: &agent_type,
+                model: &model,
+                reasoning_effort,
+                respond_to,
+                channel_add_policy,
+                description: description.as_deref(),
+                capabilities: &capability_refs,
+            })?;
+            let builder = nostr::EventBuilder::new(
+                nostr::Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
+                content.to_string(),
+            );
+            let event = client.sign_event(builder)?;
+            let event_id = event.id.to_hex();
+            client.submit_event(event).await?;
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "event_id": event_id,
+                    "action": "publish-profile",
+                    "profile": content,
+                })
+            );
+            Ok(())
+        }
         AgentsCmd::DraftCreate {
             channel,
             display_name,
@@ -254,6 +364,57 @@ fn normalize_relay_self_hex(self_hex: &str) -> Result<String, CliError> {
         )));
     }
     Ok(self_hex.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn full_profile_content_keeps_directory_and_policy_fields_together() {
+        let content = build_profile_content(ProfileDraft {
+            display_name: "Codex",
+            agent_type: "codex",
+            model: "gpt-5.6-sol",
+            reasoning_effort: ReasoningEffortArg::High,
+            respond_to: RespondToArg::Anyone,
+            channel_add_policy: ChannelAddPolicyArg::OwnerOnly,
+            description: Some("General-purpose coding agent with read-only ERP access"),
+            capabilities: &["general", "erp-read-only"],
+        })
+        .unwrap();
+
+        assert_eq!(content["name"], "Codex");
+        assert_eq!(content["display_name"], "Codex");
+        assert_eq!(content["agent_type"], "codex");
+        assert_eq!(content["model"], "gpt-5.6-sol");
+        assert_eq!(content["reasoning_effort"], "high");
+        assert_eq!(content["respond_to"], "anyone");
+        assert_eq!(content["channel_add_policy"], "owner_only");
+        assert_eq!(content["status"], "online");
+        assert_eq!(content["channels"], serde_json::json!([]));
+        assert_eq!(content["channel_ids"], serde_json::json!([]));
+        assert_eq!(
+            content["capabilities"],
+            serde_json::json!(["general", "erp-read-only"])
+        );
+    }
+
+    #[test]
+    fn full_profile_content_rejects_invalid_boundary_values() {
+        let invalid = build_profile_content(ProfileDraft {
+            display_name: " ",
+            agent_type: "Codex Agent!",
+            model: "",
+            reasoning_effort: ReasoningEffortArg::High,
+            respond_to: RespondToArg::Anyone,
+            channel_add_policy: ChannelAddPolicyArg::OwnerOnly,
+            description: None,
+            capabilities: &[],
+        });
+
+        assert!(invalid.is_err());
+    }
 }
 
 /// Fetch and verify the relay's NIP-IA archived-identities snapshot (kind

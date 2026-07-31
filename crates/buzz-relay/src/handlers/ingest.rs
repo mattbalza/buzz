@@ -40,6 +40,7 @@ use buzz_core::verification::verify_event;
 use buzz_core::CommunityId;
 use nostr::Event;
 
+use crate::config::ChannelCreatePolicy;
 use crate::state::AppState;
 
 use super::event::dispatch_persistent_event;
@@ -144,6 +145,45 @@ fn emit_product_feedback_success(
         },
         state_for_request(tenant, auth.pubkey()),
     );
+}
+
+fn exact_tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
+    let mut values = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind().to_string() == name)
+        .filter_map(|tag| tag.content());
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+fn is_huddle_create_event(event: &Event) -> bool {
+    exact_tag_value(event, "h")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .is_some()
+        && exact_tag_value(event, "visibility") == Some("private")
+        && exact_tag_value(event, "channel_type") == Some("stream")
+        && exact_tag_value(event, "ttl") == Some("3600")
+}
+
+fn channel_creation_allowed(
+    policy: ChannelCreatePolicy,
+    relay_role: Option<&str>,
+    configured_owner: Option<&str>,
+    author: &str,
+    is_huddle: bool,
+) -> bool {
+    match policy {
+        ChannelCreatePolicy::AnyMember => true,
+        ChannelCreatePolicy::OwnerOnly => {
+            is_huddle
+                || (relay_role == Some("owner")
+                    && configured_owner.is_some_and(|owner| author == owner))
+        }
+    }
 }
 
 /// Increment the rejection counter with a bounded reason and transport label.
@@ -2110,6 +2150,33 @@ async fn ingest_event_inner(
                 IngestError::Rejected(format!("invalid channel_type: {channel_type_str}"))
             })?;
 
+        let is_huddle = is_huddle_create_event(&event);
+        if state.config.channel_create_policy == ChannelCreatePolicy::OwnerOnly && !is_huddle {
+            let sender_hex = event.pubkey.to_hex();
+            let relay_member = state
+                .db
+                .get_relay_member(tenant.community(), &sender_hex)
+                .await
+                .map_err(|error| {
+                    IngestError::Internal(format!(
+                        "error: database error checking channel creation authorization: {error}"
+                    ))
+                })?;
+            let relay_role = relay_member.as_ref().map(|member| member.role.as_str());
+            if !channel_creation_allowed(
+                state.config.channel_create_policy,
+                relay_role,
+                state.config.relay_owner_pubkey.as_deref(),
+                &sender_hex,
+                is_huddle,
+            ) {
+                return Err(IngestError::AuthFailed(
+                    "restricted: only workspace owners may create durable channels or forums"
+                        .into(),
+                ));
+            }
+        }
+
         if let Some(client_uuid) = channel_id {
             let name = create_name.unwrap_or_default();
             let name = buzz_core::channel::canonical_channel_name(&name);
@@ -2641,6 +2708,116 @@ mod tests {
     fn create_group_does_not_require_h_tag() {
         // kind:9007 creates the channel — h-tag is optional (client-chosen UUID)
         assert!(!requires_h_channel_scope(KIND_NIP29_CREATE_GROUP));
+    }
+
+    #[test]
+    fn owner_only_channel_policy_requires_exact_owner_role() {
+        use crate::config::ChannelCreatePolicy;
+
+        assert!(channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            Some("owner"),
+            Some("aria-pubkey"),
+            "aria-pubkey",
+            false,
+        ));
+        assert!(!channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            Some("admin"),
+            Some("aria-pubkey"),
+            "aria-pubkey",
+            false,
+        ));
+        assert!(!channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            None,
+            Some("aria-pubkey"),
+            "aria-pubkey",
+            false,
+        ));
+        assert!(!channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            Some("owner"),
+            Some("aria-pubkey"),
+            "different-owner-pubkey",
+            false,
+        ));
+        assert!(!channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            Some("owner"),
+            None,
+            "aria-pubkey",
+            false,
+        ));
+        assert!(channel_creation_allowed(
+            ChannelCreatePolicy::AnyMember,
+            None,
+            None,
+            "member-pubkey",
+            false,
+        ));
+    }
+
+    #[test]
+    fn exact_one_hour_private_stream_is_the_only_huddle_exemption() {
+        let exact = make_event_with_tags(
+            KIND_NIP29_CREATE_GROUP,
+            "",
+            &[
+                &["h", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
+                &["visibility", "private"],
+                &["channel_type", "stream"],
+                &["ttl", "3600"],
+            ],
+        );
+        assert!(is_huddle_create_event(&exact));
+
+        for tags in [
+            vec![
+                &["h", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"][..],
+                &["visibility", "open"][..],
+                &["channel_type", "stream"][..],
+                &["ttl", "3600"][..],
+            ],
+            vec![
+                &["h", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"][..],
+                &["visibility", "private"][..],
+                &["channel_type", "forum"][..],
+                &["ttl", "3600"][..],
+            ],
+            vec![
+                &["h", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"][..],
+                &["visibility", "private"][..],
+                &["channel_type", "stream"][..],
+                &["ttl", "3599"][..],
+            ],
+            vec![
+                &["h", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"][..],
+                &["visibility", "private"][..],
+                &["channel_type", "stream"][..],
+            ],
+            vec![
+                &["visibility", "private"][..],
+                &["channel_type", "stream"][..],
+                &["ttl", "3600"][..],
+            ],
+        ] {
+            let near_miss = make_event_with_tags(KIND_NIP29_CREATE_GROUP, "", &tags);
+            assert!(!is_huddle_create_event(&near_miss));
+        }
+    }
+
+    #[test]
+    fn exact_huddle_exempts_non_owner_from_channel_policy() {
+        use crate::config::ChannelCreatePolicy;
+
+        assert!(channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            Some("member"),
+            Some("aria-pubkey"),
+            "member-pubkey",
+            true,
+        ));
     }
 
     #[test]

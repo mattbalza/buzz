@@ -30,7 +30,7 @@ use buzz_core::observer::{
 };
 use clap::Parser;
 use config::{
-    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
+    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, DmPolicy, ModelsArgs,
     MultipleEventHandling, RespondTo, SubscribeMode,
 };
 use filter::SubscriptionRule;
@@ -221,30 +221,33 @@ async fn is_owner_or_sibling(
 /// and `Allowlist` accept the owner and same-owner siblings; `Allowlist`
 /// additionally accepts the explicit external pubkey list.
 ///
-/// # DM hardening (`is_dm`)
+/// # DM policy (`is_dm`, `dm_policy`)
 ///
 /// Clients auto-p-tag every DM participant, so in a DM *any* participant's
-/// message looks like a mention and would fire a turn. Combined with
-/// agent-initiated DMs (the agent can be asked to DM a third party), that
-/// turns `anyone`/`allowlist` modes into transitive access grants: whoever
-/// lands in a DM with the agent can prompt it. To close that hole, when
-/// `is_dm` is true only the owner and cryptographically verified same-owner
-/// siblings may fire a turn — the explicit allowlist and `anyone` mode do
-/// NOT apply inside DMs. `Nobody` still drops everything. Callers must
-/// resolve `is_dm` fail-closed: unknown channel type ⇒ treat as DM.
+/// message looks like a mention and may fire a turn. `dm_policy` adds an
+/// independent boundary so deployments can keep channels open while making
+/// DMs exact-owner-only or disabling them. The normal `respond_to` gate still
+/// applies after the DM-specific gate. Callers must resolve `is_dm`
+/// fail-closed: unknown channel type ⇒ treat as DM.
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
     author: &str,
     is_dm: bool,
+    dm_policy: DmPolicy,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
 ) -> bool {
     if is_dm {
-        return match respond_to {
-            RespondTo::Nobody => false,
-            _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
-        };
+        match dm_policy {
+            DmPolicy::Disabled => return false,
+            DmPolicy::OwnerOnly => {
+                if owner_cache.get().is_none_or(|owner| author != owner) {
+                    return false;
+                }
+            }
+            DmPolicy::Anyone => {}
+        }
     }
     match respond_to {
         RespondTo::Anyone => true,
@@ -2155,6 +2158,7 @@ async fn tokio_main() -> Result<()> {
                                     &config.respond_to_allowlist,
                                     &author,
                                     is_dm,
+                                    config.dm_policy,
                                     &owner_cache,
                                     &ctx.rest_client,
                                 )
@@ -4406,6 +4410,7 @@ mod author_gate_tests {
                 &allowlist,
                 SIBLING,
                 false,
+                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4424,6 +4429,7 @@ mod author_gate_tests {
                 &allowlist,
                 EXTERNAL,
                 false,
+                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4442,6 +4448,7 @@ mod author_gate_tests {
                 &allowlist,
                 STRANGER,
                 false,
+                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4460,6 +4467,7 @@ mod author_gate_tests {
                 &allowlist,
                 OWNER,
                 false,
+                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4481,6 +4489,7 @@ mod author_gate_tests {
                 &HashSet::new(),
                 STRANGER,
                 false,
+                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4499,6 +4508,7 @@ mod author_gate_tests {
                     &HashSet::new(),
                     who,
                     false,
+                    DmPolicy::Anyone,
                     &cache,
                     &dummy_rest_client()
                 )
@@ -4510,85 +4520,80 @@ mod author_gate_tests {
 
     // ── DM hardening ──────────────────────────────────────────────────────
     //
-    // In a DM, clients auto-p-tag every participant, and an agent can be
-    // asked to open a DM with a third party. The gate must therefore ignore
-    // the allowlist and `anyone` mode inside DMs: only owner + verified
-    // siblings fire turns.
+    // DM policy is separate from the channel author gate. Production can
+    // therefore use respond_to=anyone for channels and owner-only for DMs.
 
     #[tokio::test]
-    async fn test_dm_rejects_allowlisted_external_pubkey() {
+    async fn test_dm_owner_only_accepts_exact_owner() {
         let cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
-            !author_allowed(
-                &RespondTo::Allowlist,
-                &allowlist,
-                EXTERNAL,
+            author_allowed(
+                &RespondTo::Anyone,
+                &HashSet::new(),
+                OWNER,
                 true,
+                DmPolicy::OwnerOnly,
                 &cache,
                 &dummy_rest_client()
             )
             .await,
-            "an allowlisted external pubkey must NOT fire a turn inside a DM"
+            "the exact configured owner must fire a turn under owner-only DM policy"
         );
     }
 
     #[tokio::test]
-    async fn test_dm_rejects_stranger_under_anyone() {
+    async fn test_dm_owner_only_rejects_sibling_and_stranger() {
+        let cache = cache_with_sibling();
+        for (who, label) in [(SIBLING, "sibling"), (STRANGER, "stranger")] {
+            assert!(
+                !author_allowed(
+                    &RespondTo::Anyone,
+                    &HashSet::new(),
+                    who,
+                    true,
+                    DmPolicy::OwnerOnly,
+                    &cache,
+                    &dummy_rest_client()
+                )
+                .await,
+                "a {label} must not pass the exact-owner DM gate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dm_disabled_rejects_even_owner() {
         let cache = cache_with_sibling();
         assert!(
             !author_allowed(
                 &RespondTo::Anyone,
                 &HashSet::new(),
-                STRANGER,
+                OWNER,
                 true,
+                DmPolicy::Disabled,
                 &cache,
                 &dummy_rest_client()
             )
             .await,
-            "respond_to=anyone must still drop non-owner authors inside a DM"
+            "disabled DM policy must drop everything"
         );
     }
 
     #[tokio::test]
-    async fn test_dm_admits_owner_and_sibling_in_every_responding_mode() {
-        let cache = cache_with_sibling();
-        for mode in [
-            RespondTo::OwnerOnly,
-            RespondTo::Allowlist,
-            RespondTo::Anyone,
-        ] {
-            for (who, label) in [(OWNER, "owner"), (SIBLING, "sibling")] {
-                assert!(
-                    author_allowed(
-                        &mode,
-                        &HashSet::new(),
-                        who,
-                        true,
-                        &cache,
-                        &dummy_rest_client()
-                    )
-                    .await,
-                    "in a DM under {mode}, the {label} must still be admitted"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_dm_nobody_rejects_even_owner() {
+    async fn test_dm_anyone_preserves_global_author_policy() {
         let cache = cache_with_sibling();
         assert!(
-            !author_allowed(
-                &RespondTo::Nobody,
+            author_allowed(
+                &RespondTo::Anyone,
                 &HashSet::new(),
-                OWNER,
+                STRANGER,
                 true,
+                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
             .await,
-            "respond_to=nobody must drop everything, DMs included"
+            "the backward-compatible DM default must defer to respond_to=anyone"
         );
     }
 
@@ -4721,6 +4726,7 @@ mod author_gate_tests {
                 &allowlist,
                 EXTERNAL,
                 is_dm,
+                DmPolicy::OwnerOnly,
                 &owner_cache,
                 &dummy_rest_client(),
             )
@@ -4975,6 +4981,7 @@ mod build_mcp_servers_tests {
             model: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
+            dm_policy: config::DmPolicy::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
@@ -5141,6 +5148,7 @@ mod error_outcome_emission_tests {
             model: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
+            dm_policy: config::DmPolicy::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],

@@ -24,6 +24,39 @@ pub enum ConfigError {
     InvalidValue(String),
 }
 
+/// Who may create durable channels and forums through kind:9007 events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChannelCreatePolicy {
+    /// Any authenticated workspace member may create a channel.
+    #[default]
+    AnyMember,
+    /// Only a workspace member with the exact `owner` role may create a durable channel.
+    OwnerOnly,
+}
+
+fn parse_channel_create_policy(raw: Option<&str>) -> Result<ChannelCreatePolicy, ConfigError> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("any-member") => Ok(ChannelCreatePolicy::AnyMember),
+        Some("owner-only") => Ok(ChannelCreatePolicy::OwnerOnly),
+        Some(value) => Err(ConfigError::InvalidValue(format!(
+            "BUZZ_RELAY_CHANNEL_CREATE_POLICY must be any-member or owner-only, got {value:?}"
+        ))),
+    }
+}
+
+fn validate_channel_create_policy(
+    policy: ChannelCreatePolicy,
+    relay_owner_pubkey: Option<&str>,
+) -> Result<(), ConfigError> {
+    if policy == ChannelCreatePolicy::OwnerOnly && relay_owner_pubkey.is_none() {
+        return Err(ConfigError::InvalidValue(
+            "RELAY_OWNER_PUBKEY is required when BUZZ_RELAY_CHANNEL_CREATE_POLICY=owner-only"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Deny-by-default read-only deployment-admin configuration.
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
@@ -110,6 +143,9 @@ pub struct Config {
     /// When false (default), the check is a no-op and all authenticated callers
     /// are permitted regardless of auth method (API token, NIP-42).
     pub require_relay_membership: bool,
+
+    /// Authorization policy for durable channel and forum creation.
+    pub channel_create_policy: ChannelCreatePolicy,
 
     /// Whether this deployment can serve huddle (voice) audio.
     ///
@@ -484,6 +520,16 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
+        let channel_create_policy = match std::env::var("BUZZ_RELAY_CHANNEL_CREATE_POLICY") {
+            Ok(value) => parse_channel_create_policy(Some(&value))?,
+            Err(std::env::VarError::NotPresent) => parse_channel_create_policy(None)?,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidValue(
+                    "BUZZ_RELAY_CHANNEL_CREATE_POLICY must be valid Unicode".to_string(),
+                ));
+            }
+        };
+
         // Defaults true → single-pod (N=1) keeps today's huddle behavior. A
         // horizontally-scaled deployment sets this false; see the field doc.
         let huddle_audio_available = std::env::var("BUZZ_HUDDLE_AUDIO_AVAILABLE")
@@ -540,6 +586,7 @@ impl Config {
                     None
                 }
             });
+        validate_channel_create_policy(channel_create_policy, relay_owner_pubkey.as_deref())?;
 
         // Note: intentionally not prefixed with BUZZ_ — same relay-identity
         // config family as RELAY_OWNER_PUBKEY. Comma-separated 64-char hex
@@ -891,6 +938,7 @@ impl Config {
             metrics_port,
             pubkey_allowlist_enabled,
             require_relay_membership,
+            channel_create_policy,
             huddle_audio_available,
             mesh,
             mesh_demo_echo,
@@ -954,6 +1002,11 @@ mod tests {
             !config.require_relay_membership,
             "require_relay_membership should default to false"
         );
+        assert_eq!(
+            config.channel_create_policy,
+            ChannelCreatePolicy::AnyMember,
+            "channel creation must remain backward-compatible unless explicitly restricted"
+        );
         assert!(
             config.relay_owner_pubkey.is_none(),
             "relay_owner_pubkey should default to None"
@@ -982,6 +1035,30 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn channel_create_policy_parser_is_strict() {
+        assert_eq!(
+            parse_channel_create_policy(None).unwrap(),
+            ChannelCreatePolicy::AnyMember
+        );
+        assert_eq!(
+            parse_channel_create_policy(Some("owner-only")).unwrap(),
+            ChannelCreatePolicy::OwnerOnly
+        );
+        assert!(parse_channel_create_policy(Some("owners")).is_err());
+    }
+
+    #[test]
+    fn owner_only_channel_policy_requires_configured_owner_pubkey() {
+        assert!(validate_channel_create_policy(ChannelCreatePolicy::OwnerOnly, None,).is_err());
+        assert!(validate_channel_create_policy(
+            ChannelCreatePolicy::OwnerOnly,
+            Some(&"a".repeat(64)),
+        )
+        .is_ok());
+        assert!(validate_channel_create_policy(ChannelCreatePolicy::AnyMember, None).is_ok());
     }
 
     #[test]
