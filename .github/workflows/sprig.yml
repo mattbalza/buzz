@@ -193,6 +193,17 @@ jobs:
             gh release upload "$TAG" "$BUNDLE_PATH"
           fi
 
+          PREVIOUS_BUNDLE=""
+          PREVIOUS_MANIFEST_DIR="$(mktemp -d)"
+          if gh release download "$TAG" --pattern sprig-manifest.json \
+            --dir "$PREVIOUS_MANIFEST_DIR" 2>/dev/null; then
+            if ! PREVIOUS_BUNDLE="$(jq -r \
+              'if .schema_version == 1 and (.bundle | type == "string") then .bundle else empty end' \
+              "$PREVIOUS_MANIFEST_DIR/sprig-manifest.json")"; then
+              PREVIOUS_BUNDLE=""
+            fi
+          fi
+
           MANIFEST_PATH="${RUNNER_TEMP}/sprig-manifest.json"
           jq -n \
             --arg git_sha "$SHA" \
@@ -207,6 +218,29 @@ jobs:
           test "$(jq -r '.git_sha' "$VERIFY_DIR/sprig-manifest.json")" = "$SHA"
           test "$(jq -r '.bundle' "$VERIFY_DIR/sprig-manifest.json")" = "$BUNDLE_NAME"
           test "$(jq -r '.sha256' "$VERIFY_DIR/sprig-manifest.json")" = "$BUNDLE_SHA256"
+
+          # Retain the active bundle plus one rollback bundle. Cleanup happens
+          # only after the manifest pointer has been downloaded and verified.
+          RELEASE_ID="$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.id')"
+          ASSET_INDEX="$(mktemp)"
+          gh api --paginate "repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | select(.name | startswith("sprig-bundle-")) | [.created_at, (.id | tostring), .name] | @tsv' \
+            | sort -r > "$ASSET_INDEX"
+          CURRENT_BUNDLE_PREFIX="sprig-bundle-${SHA}-"
+          ROLLBACK_BUNDLE=""
+          if [[ -n "$PREVIOUS_BUNDLE" && "$PREVIOUS_BUNDLE" != "$BUNDLE_NAME" ]] \
+            && [[ "$PREVIOUS_BUNDLE" != "$CURRENT_BUNDLE_PREFIX"* ]] \
+            && awk -F '\t' -v previous="$PREVIOUS_BUNDLE" '$3 == previous { found = 1 } END { exit !found }' "$ASSET_INDEX"; then
+            ROLLBACK_BUNDLE="$PREVIOUS_BUNDLE"
+          else
+            ROLLBACK_BUNDLE="$(awk -F '\t' -v prefix="$CURRENT_BUNDLE_PREFIX" \
+              'index($3, prefix) != 1 { print $3; exit }' "$ASSET_INDEX")"
+          fi
+          while IFS=$'\t' read -r _created_at asset_id asset_name; do
+            if [[ "$asset_name" != "$BUNDLE_NAME" && "$asset_name" != "$ROLLBACK_BUNDLE" ]]; then
+              gh api --method DELETE "repos/${REPO}/releases/assets/${asset_id}"
+            fi
+          done < "$ASSET_INDEX"
 
   publish-tag:
     name: Publish tagged release
