@@ -53,6 +53,18 @@ fi
 grep -q 'verify-release-ref\.sh' "$repo_root/.github/workflows/release.yml"
 grep -q 'verify-release-ref\.sh' "$repo_root/.github/workflows/docker.yml"
 grep -q 'test-release-ref-contract\.sh' "$repo_root/.github/workflows/ci.yml"
+docker_workflow="$repo_root/.github/workflows/docker.yml"
+unsafe_pr_cache_condition="github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+cache_destinations=$(awk '/cache-to:/ { print; getline; print }' "$docker_workflow")
+if grep -Fq "$unsafe_pr_cache_condition" "$docker_workflow"; then
+  echo "pull-request Docker builds can receive registry credentials or write caches" >&2
+  exit 1
+fi
+[[ "$(grep -Fc "github.event_name != 'pull_request' && format('type=registry,ref=" <<<"$cache_destinations")" -eq 2 ]] || {
+  echo "relay and push-gateway caches must be writable only outside pull requests" >&2
+  exit 1
+}
+
 "$repo_root/scripts/test-signed-canary-contract.sh"
 auto_tag="$repo_root/.github/workflows/auto-tag-on-release-pr-merge.yml"
 grep -q 'actions/create-github-app-token@' "$auto_tag"
