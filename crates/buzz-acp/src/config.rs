@@ -265,8 +265,26 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_RELAY_URL", default_value = "ws://localhost:3000")]
     pub relay_url: String,
 
-    #[arg(long, env = "BUZZ_PRIVATE_KEY", hide_env_values = true)]
-    pub private_key: String,
+    #[arg(
+        long,
+        env = "BUZZ_PRIVATE_KEY",
+        hide_env_values = true,
+        required_unless_present = "private_key_file",
+        conflicts_with = "private_key_file"
+    )]
+    pub private_key: Option<String>,
+
+    /// File containing the agent's Nostr private key. Intended for systemd
+    /// credentials so the signing key never needs to enter the environment.
+    #[arg(
+        long,
+        env = "BUZZ_PRIVATE_KEY_FILE",
+        value_name = "PATH",
+        hide_env_values = true,
+        required_unless_present = "private_key",
+        conflicts_with = "private_key"
+    )]
+    pub private_key_file: Option<PathBuf>,
 
     /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
@@ -864,13 +882,28 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
-        let keys = Keys::parse(&args.private_key)?;
+        let mut private_key = match (args.private_key.take(), args.private_key_file.as_ref()) {
+            (Some(value), None) => value,
+            (None, Some(path)) => std::fs::read_to_string(path)?.trim().to_string(),
+            // clap enforces this for CLI parsing; retain a boundary check for
+            // callers that may construct CliArgs directly in the future.
+            _ => {
+                return Err(ConfigError::ConfigFile(
+                    "exactly one of --private-key or --private-key-file is required".into(),
+                ));
+            }
+        };
+        if private_key.is_empty() {
+            return Err(ConfigError::ConfigFile(
+                "private-key file must not be empty".into(),
+            ));
+        }
+        let keys = Keys::parse(&private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
         // crate we can only clear the String — the allocator may retain copies.
-        args.private_key
-            .replace_range(.., &"0".repeat(args.private_key.len()));
-        args.private_key.clear();
+        private_key.replace_range(.., &"0".repeat(private_key.len()));
+        private_key.clear();
 
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
@@ -2784,6 +2817,44 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn private_key_file_full_path_loads_identity_without_key_argument() {
+        let path =
+            std::env::temp_dir().join(format!("buzz-acp-private-key-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, format!("{TEST_PRIVATE_KEY}\n")).expect("write private-key fixture");
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key-file",
+            path.to_str().expect("utf-8 temp path"),
+        ])
+        .expect("clap should accept a private-key file without --private-key");
+        let config = Config::from_args(args).expect("private-key file should build config");
+        std::fs::remove_file(path).expect("remove private-key fixture");
+
+        let expected = Keys::parse(TEST_PRIVATE_KEY).expect("valid fixture key");
+        assert_eq!(config.keys.public_key(), expected.public_key());
+    }
+
+    #[test]
+    fn private_key_sources_are_mutually_exclusive() {
+        let path =
+            std::env::temp_dir().join(format!("buzz-acp-private-key-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, TEST_PRIVATE_KEY).expect("write private-key fixture");
+
+        let error = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--private-key-file",
+            path.to_str().expect("utf-8 temp path"),
+        ])
+        .expect_err("inline and file key sources must conflict");
+
+        std::fs::remove_file(path).expect("remove private-key fixture");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

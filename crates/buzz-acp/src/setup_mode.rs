@@ -25,8 +25,7 @@
 //!
 //! Connect → subscribe → on each matching event:
 //! 1. Apply `ignore_self` gate.
-//! 2. Apply `author_allowed` gate (same as normal mode) so the nudge goes
-//!    only to authors the real agent would answer.
+//! 2. Apply the DM policy before the global `author_allowed` gate.
 //! 3. Require an explicit @mention via `event_mentions_agent`.
 //! 4. Apply `filter::match_event` so channel/kind rules still constrain.
 //! 5. Build and publish a nudge reply (surface-correct copy).
@@ -316,10 +315,8 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     let pubkey_hex = config.keys.public_key().to_hex();
 
     // Parse BUZZ_AUTH_TAG for relay membership / NIP-OA.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
+    let relay_auth_tag: Option<nostr::Tag> =
+        crate::auth_tag_value().and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
 
     let startup_watermark: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -430,16 +427,16 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         // DM policy too, failing closed when the channel type is unknown.
         let author_hex = buzz_event.event.pubkey.to_hex();
         let is_dm = crate::is_dm_channel(buzz_event.channel_id, &channel_info).await;
-        let allowed = author_allowed(
-            &config.respond_to,
-            &config.respond_to_allowlist,
-            &author_hex,
-            is_dm,
-            config.dm_policy,
-            &owner_cache,
-            &rest_client,
-        )
-        .await;
+        let allowed =
+            crate::dm_policy_allows_author(config.dm_policy, is_dm, &author_hex, &owner_cache)
+                && author_allowed(
+                    &config.respond_to,
+                    &config.respond_to_allowlist,
+                    &author_hex,
+                    &owner_cache,
+                    &rest_client,
+                )
+                .await;
 
         // Apply channel/kind filter rules.
         let filter_matched = filter::match_event(
