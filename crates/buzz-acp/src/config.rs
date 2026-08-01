@@ -111,6 +111,31 @@ impl std::fmt::Display for RespondTo {
     }
 }
 
+/// Additional author gate applied only to direct and group-DM channels.
+///
+/// This is intentionally independent from [`RespondTo`], so a deployment can
+/// accept every workspace member in channels while keeping DMs owner-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+pub enum DmPolicy {
+    /// Apply no DM-specific restriction; the normal `respond-to` gate decides.
+    #[default]
+    Anyone,
+    /// Accept only the exact configured owner pubkey in DMs.
+    OwnerOnly,
+    /// Drop every DM before subscription matching and model invocation.
+    Disabled,
+}
+
+impl std::fmt::Display for DmPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anyone => f.write_str("anyone"),
+            Self::OwnerOnly => f.write_str("owner-only"),
+            Self::Disabled => f.write_str("disabled"),
+        }
+    }
+}
+
 /// Permission mode for agents that support `session/set_config_option` with
 /// `configId: "mode"` (e.g. `claude-agent-acp`).
 ///
@@ -453,6 +478,10 @@ pub struct CliArgs {
     )]
     pub respond_to: RespondTo,
 
+    /// Additional inbound author policy for direct and group DMs.
+    #[arg(long, env = "BUZZ_ACP_DM_POLICY", default_value = "anyone", value_enum)]
+    pub dm_policy: DmPolicy,
+
     /// Comma-separated 64-char hex pubkeys for allowlist mode.
     /// Owner pubkey is always implicitly included.
     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
@@ -535,6 +564,8 @@ pub struct Config {
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
     pub respond_to: RespondTo,
+    /// Additional author gate applied only to direct and group DMs.
+    pub dm_policy: DmPolicy,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
     pub respond_to_allowlist: HashSet<String>,
     /// Allowed `respond_to` modes. Empty = all modes allowed.
@@ -1093,6 +1124,7 @@ impl Config {
                 .and_then(sanitize_session_title),
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
+            dm_policy: args.dm_policy,
             respond_to_allowlist,
             allowed_respond_to,
             persona_env_vars,
@@ -1123,7 +1155,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {} dm_policy={}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1145,6 +1177,7 @@ impl Config {
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
             respond_to_detail,
+            self.dm_policy,
             allowed_respond_to_detail,
         )
     }
@@ -1463,6 +1496,7 @@ mod tests {
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
+            dm_policy: DmPolicy::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: Vec::new(),
             persona_env_vars: vec![],
@@ -2430,6 +2464,40 @@ channels = "ALL"
             RespondTo::from_str("nobody", true).unwrap(),
             RespondTo::Nobody
         );
+    }
+
+    #[test]
+    fn test_dm_policy_defaults_to_anyone_for_backward_compatibility() {
+        assert_eq!(DmPolicy::default(), DmPolicy::Anyone);
+        let key = Keys::generate().secret_key().to_secret_hex();
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(args.dm_policy, DmPolicy::Anyone);
+    }
+
+    #[test]
+    fn test_dm_policy_display_and_value_enum_parsing() {
+        use clap::ValueEnum;
+
+        assert_eq!(format!("{}", DmPolicy::Anyone), "anyone");
+        assert_eq!(format!("{}", DmPolicy::OwnerOnly), "owner-only");
+        assert_eq!(format!("{}", DmPolicy::Disabled), "disabled");
+        assert_eq!(
+            DmPolicy::from_str("owner-only", true).unwrap(),
+            DmPolicy::OwnerOnly
+        );
+        assert_eq!(
+            DmPolicy::from_str("disabled", true).unwrap(),
+            DmPolicy::Disabled
+        );
+        let key = Keys::generate().secret_key().to_secret_hex();
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--dm-policy",
+            "owner-only",
+        ]);
+        assert_eq!(args.dm_policy, DmPolicy::OwnerOnly);
     }
 
     #[test]

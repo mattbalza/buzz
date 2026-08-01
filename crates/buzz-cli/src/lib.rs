@@ -256,8 +256,73 @@ impl RespondToArg {
     }
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ChannelAddPolicyArg {
+    #[value(name = "anyone")]
+    Anyone,
+    #[value(name = "owner-only", alias = "owner_only")]
+    OwnerOnly,
+    #[value(name = "nobody")]
+    Nobody,
+}
+
+impl ChannelAddPolicyArg {
+    fn to_wire(self) -> &'static str {
+        match self {
+            Self::Anyone => "anyone",
+            Self::OwnerOnly => "owner_only",
+            Self::Nobody => "nobody",
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ReasoningEffortArg {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffortArg {
+    fn to_wire(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// Publish this identity's complete remote-agent directory profile
+    #[command(name = "publish-profile")]
+    PublishProfile {
+        /// Human-readable agent name
+        #[arg(long)]
+        display_name: String,
+        /// Agent type slug, for example erp, codex, or claude
+        #[arg(long)]
+        agent_type: String,
+        /// Configured model identifier
+        #[arg(long)]
+        model: String,
+        /// Configured model reasoning or effort level
+        #[arg(long, value_enum)]
+        reasoning_effort: ReasoningEffortArg,
+        /// Public channel response policy
+        #[arg(long, value_enum)]
+        respond_to: RespondToArg,
+        /// Who may add this agent to channels
+        #[arg(long, value_enum)]
+        channel_add_policy: ChannelAddPolicyArg,
+        /// Optional directory description
+        #[arg(long)]
+        description: Option<String>,
+        /// Repeatable capability slug
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+    },
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
@@ -1937,6 +2002,7 @@ mod tests {
                 "archived",
                 "draft-create",
                 "draft-update",
+                "publish-profile",
                 "unarchive"
             ]
         );
@@ -2063,7 +2129,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 6),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
