@@ -35,7 +35,7 @@ use config::{
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
-use nostr::PublicKey;
+use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
     PromptResult, PromptSource, SessionState, TimeoutKind,
@@ -4209,6 +4209,23 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                 name: "BUZZ_RELAY_URL".into(),
                 value: config.relay_url.clone(),
             }];
+            if !config.isolate_mcp_identity {
+                env.push(EnvVar {
+                    name: "BUZZ_PRIVATE_KEY".into(),
+                    // bech32 encoding of a valid secret key is infallible.
+                    value: config
+                        .keys
+                        .secret_key()
+                        .to_bech32()
+                        .expect("secret key bech32 encoding should never fail"),
+                });
+                if let Some(auth_tag) = auth_tag_value() {
+                    env.push(EnvVar {
+                        name: "BUZZ_AUTH_TAG".into(),
+                        value: auth_tag,
+                    });
+                }
+            }
             // Forward the agent's display name so dev-mcp can use it as the git
             // author name instead of the raw npub. Read from the process env
             // rather than Config: this is a pass-through of a contract owned
@@ -5067,6 +5084,7 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            isolate_mcp_identity: false,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -5107,7 +5125,7 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn session_new_mcp_server_exposes_only_non_secret_relay_metadata() {
+    fn session_new_mcp_server_forwards_relay_identity_by_default() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5123,18 +5141,33 @@ mod build_mcp_servers_tests {
             "missing BUZZ_RELAY_URL; got {names:?}"
         );
         assert!(
-            !names.contains(&"BUZZ_PRIVATE_KEY"),
-            "private signing key crossed the ACP/MCP boundary: {names:?}"
+            names.contains(&"BUZZ_PRIVATE_KEY"),
+            "default compatibility contract omitted BUZZ_PRIVATE_KEY: {names:?}"
         );
     }
 
     #[test]
-    fn session_new_mcp_server_never_forwards_buzz_auth_tag() {
+    fn session_new_mcp_server_forwards_buzz_auth_tag_by_default() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
-        let config = test_config();
+        let servers = build_mcp_servers(&test_config());
+        std::env::remove_var("BUZZ_AUTH_TAG");
+
+        assert!(servers[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_AUTH_TAG" && entry.value == "test-attestation-tag"
+        }));
+    }
+
+    #[test]
+    fn session_new_mcp_server_isolates_relay_identity_when_configured() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
+        let mut config = test_config();
+        config.isolate_mcp_identity = true;
         let servers = build_mcp_servers(&config);
         std::env::remove_var("BUZZ_AUTH_TAG");
 
@@ -5142,6 +5175,13 @@ mod build_mcp_servers_tests {
         assert!(
             !server.env.iter().any(|entry| entry.name == "BUZZ_AUTH_TAG"),
             "owner attestation credential crossed the ACP/MCP boundary"
+        );
+        assert!(
+            !server
+                .env
+                .iter()
+                .any(|entry| entry.name == "BUZZ_PRIVATE_KEY"),
+            "private signing key crossed the isolated ACP/MCP boundary"
         );
     }
 
@@ -5170,7 +5210,9 @@ mod build_mcp_servers_tests {
         std::env::set_var("AGENT_LABEL", "erp");
         std::env::set_var("UNRELATED_SECRET", "must-not-leak");
 
-        let servers = build_mcp_servers(&test_config());
+        let mut config = test_config();
+        config.isolate_mcp_identity = true;
+        let servers = build_mcp_servers(&config);
 
         std::env::remove_var("BUZZ_ACP_MCP_ENV_VARS");
         std::env::remove_var("ERP_MCP_BROKER_SOCKET");
@@ -5219,7 +5261,9 @@ mod build_mcp_servers_tests {
             std::env::set_var(name, value);
         }
 
-        let servers = build_mcp_servers(&test_config());
+        let mut config = test_config();
+        config.isolate_mcp_identity = true;
+        let servers = build_mcp_servers(&config);
 
         for (name, _) in variables {
             std::env::remove_var(name);
@@ -5416,6 +5460,7 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            isolate_mcp_identity: false,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

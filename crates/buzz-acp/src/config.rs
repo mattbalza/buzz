@@ -304,6 +304,11 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
     pub mcp_command: String,
 
+    /// Keep the relay signing identity out of session MCP servers. Disabled by
+    /// default for compatibility with buzz-dev-mcp and the Buzz CLI contract.
+    #[arg(long, env = "BUZZ_ACP_ISOLATE_MCP_IDENTITY", default_value_t = false)]
+    pub isolate_mcp_identity: bool,
+
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
     #[arg(long, env = "BUZZ_ACP_IDLE_TIMEOUT")]
@@ -542,6 +547,7 @@ pub struct Config {
     pub agent_command: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
+    pub isolate_mcp_identity: bool,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -1123,6 +1129,7 @@ impl Config {
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
+            isolate_mcp_identity: args.isolate_mcp_identity,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1188,12 +1195,13 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {} dm_policy={}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} mcp_identity={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {} dm_policy={}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
             self.agent_args.join(" "),
             self.mcp_command,
+            if self.isolate_mcp_identity { "isolated" } else { "forwarded" },
             self.idle_timeout_secs,
             self.max_turn_duration_secs,
             self.agents,
@@ -1503,6 +1511,7 @@ mod tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
+            isolate_mcp_identity: false,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -2817,6 +2826,22 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn mcp_identity_is_forwarded_by_default_and_can_be_isolated() {
+        let default_args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("default CLI should parse");
+        assert!(!default_args.isolate_mcp_identity);
+
+        let isolated_args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--isolate-mcp-identity",
+        ])
+        .expect("identity isolation opt-out should parse");
+        assert!(isolated_args.isolate_mcp_identity);
+    }
 
     #[test]
     fn private_key_file_full_path_loads_identity_without_key_argument() {
