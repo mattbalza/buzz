@@ -139,6 +139,17 @@ jobs:
           TITLE="Sprig (rolling)"
           NOTES="Rolling Linux build of Sprig (all-in-one buzz-acp + buzz-agent + buzz-dev-mcp), tracking \`main\` (\`${SHA}\`)."
 
+          # `gh release edit` fails with "release not found" until the rolling
+          # release exists, so the first run on any repo — a new fork, a
+          # re-created repo, or this one before `sprig-latest` was ever cut —
+          # cannot bootstrap it. Create it on demand, then edit as before so
+          # the title/notes still track the current SHA.
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --prerelease \
+              --target "$SHA" \
+              --title "$TITLE" \
+              --notes "$NOTES"
           gh release edit "$TAG" \
             --prerelease \
             --title "$TITLE" \
