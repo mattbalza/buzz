@@ -4255,6 +4255,11 @@ fn append_allowlisted_mcp_env(env: &mut Vec<EnvVar>) {
                 | "BUZZ_AUTH_TAG"
                 | "BUZZ_AUTH_TAG_FILE"
                 | "BUZZ_AGENT_IDENTITY_FILE"
+                | "CLAUDE_CODE_OAUTH_TOKEN"
+                | "ANTHROPIC_API_KEY"
+                | "CLAUDE_API_KEY"
+                | "OPENAI_API_KEY"
+                | "CODEX_HOME"
                 | "ERP_CONNECTOR_KEY_FILE"
                 | "ERP_CONNECTOR_API_KEY"
         ) {
@@ -5194,7 +5199,7 @@ mod build_mcp_servers_tests {
         let variables = [
             (
                 "BUZZ_ACP_MCP_ENV_VARS",
-                "ERP_MCP_BROKER_SOCKET,BUZZ_PRIVATE_KEY,BUZZ_PRIVATE_KEY_FILE,BUZZ_AUTH_TAG,BUZZ_AUTH_TAG_FILE,BUZZ_AGENT_IDENTITY_FILE,ERP_CONNECTOR_KEY_FILE,ERP_CONNECTOR_API_KEY",
+                "ERP_MCP_BROKER_SOCKET,BUZZ_PRIVATE_KEY,BUZZ_PRIVATE_KEY_FILE,BUZZ_AUTH_TAG,BUZZ_AUTH_TAG_FILE,BUZZ_AGENT_IDENTITY_FILE,CLAUDE_CODE_OAUTH_TOKEN,ANTHROPIC_API_KEY,CLAUDE_API_KEY,OPENAI_API_KEY,CODEX_HOME,ERP_CONNECTOR_KEY_FILE,ERP_CONNECTOR_API_KEY",
             ),
             ("ERP_MCP_BROKER_SOCKET", "/run/buzz-erp-mcp/codex.sock"),
             ("BUZZ_PRIVATE_KEY", "must-not-cross"),
@@ -5202,6 +5207,11 @@ mod build_mcp_servers_tests {
             ("BUZZ_AUTH_TAG", "must-not-cross"),
             ("BUZZ_AUTH_TAG_FILE", "/run/credentials/auth-tag"),
             ("BUZZ_AGENT_IDENTITY_FILE", "/etc/scalarly/identity"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "must-not-cross"),
+            ("ANTHROPIC_API_KEY", "must-not-cross"),
+            ("CLAUDE_API_KEY", "must-not-cross"),
+            ("OPENAI_API_KEY", "must-not-cross"),
+            ("CODEX_HOME", "/var/lib/buzz-codex/.codex"),
             ("ERP_CONNECTOR_KEY_FILE", "/etc/scalarly/connector"),
             ("ERP_CONNECTOR_API_KEY", "must-not-cross"),
         ];
@@ -5224,6 +5234,11 @@ mod build_mcp_servers_tests {
             "BUZZ_AUTH_TAG",
             "BUZZ_AUTH_TAG_FILE",
             "BUZZ_AGENT_IDENTITY_FILE",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_HOME",
             "ERP_CONNECTOR_KEY_FILE",
             "ERP_CONNECTOR_API_KEY",
         ] {
