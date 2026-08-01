@@ -64,6 +64,18 @@ fi
   echo "relay and push-gateway caches must be writable only outside pull requests" >&2
   exit 1
 }
+grep -Fq "format('ghcr.io/{0}/buzz', github.repository_owner)" "$docker_workflow" || {
+  echo "relay image does not default to the authenticated repository owner" >&2
+  exit 1
+}
+grep -Fq "format('ghcr.io/{0}/buzz-push-gateway', github.repository_owner)" "$docker_workflow" || {
+  echo "push-gateway image does not default to the authenticated repository owner" >&2
+  exit 1
+}
+if grep -vE '^\s*#' "$docker_workflow" | grep -Fq 'ghcr.io/block/'; then
+  echo "Docker publishing still contains an operational Block-only image reference" >&2
+  exit 1
+fi
 
 "$repo_root/scripts/test-signed-canary-contract.sh"
 auto_tag="$repo_root/.github/workflows/auto-tag-on-release-pr-merge.yml"
