@@ -1050,6 +1050,28 @@ pub async fn cmd_remove_channel_member(
     Ok(())
 }
 
+/// The signing identity's own kind:10100 profile body, or an empty object.
+async fn fetch_own_profile(client: &BuzzClient) -> Result<serde_json::Value, CliError> {
+    let events = client
+        .query_paginated(
+            serde_json::json!({
+                "kinds": [buzz_sdk::kind::KIND_AGENT_PROFILE],
+                "authors": [client.keys().public_key().to_hex()],
+                "limit": 1,
+            }),
+            1,
+        )
+        .await?;
+    let body = events
+        .first()
+        .and_then(|e| e.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(body)
+}
+
 /// Set the channel addition policy — sign and submit a kind:10100 (agent profile) event.
 pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(), CliError> {
     match policy {
@@ -1081,7 +1103,13 @@ pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(),
         }
     }
 
-    let content = serde_json::json!({ "channel_add_policy": policy }).to_string();
+    // kind:10100 is replaceable, so publishing a lone policy field deletes the
+    // rest of the profile — name, respond_to, channel_ids and all. The agent
+    // keeps working and simply stops being mentionable, which reads as a client
+    // bug rather than as the last policy change. Merge into what is published.
+    let mut content = fetch_own_profile(client).await?;
+    content["channel_add_policy"] = serde_json::json!(policy);
+    let content = content.to_string();
     use nostr::{EventBuilder, Kind};
     let builder = EventBuilder::new(
         Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
