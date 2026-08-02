@@ -13,6 +13,55 @@ use crate::commands::channel_templates::{self, ChannelTemplateRecord, TemplateAg
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
 
+/// One channel the signing identity belongs to.
+pub struct ChannelMembership {
+    /// Channel UUID, as it appears in the kind:39002 `d` tag.
+    pub id: String,
+    /// Channel name from kind:39000, or the id when metadata is missing.
+    pub name: String,
+}
+
+/// Channels the signing identity is a member of, newest metadata wins.
+///
+/// Resolved the same way `channels list --member` does: kind:39002 by `#p`,
+/// then kind:39000 for the names.
+pub async fn my_channel_memberships(
+    client: &BuzzClient,
+) -> Result<Vec<ChannelMembership>, CliError> {
+    let my_pk = client.keys().public_key().to_hex();
+    let member_events = client
+        .query_paginated(serde_json::json!({"kinds": [39002], "#p": [my_pk]}), 500)
+        .await?;
+    let ids: Vec<String> = member_events
+        .iter()
+        .map(extract_d_tag)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let metadata = client
+        .query_paginated(
+            serde_json::json!({"kinds": [39000], "#d": ids.clone()}),
+            500,
+        )
+        .await?;
+    let names: std::collections::HashMap<String, String> = metadata
+        .iter()
+        .map(|e| (extract_d_tag(e), extract_tag_value(e, "name")))
+        .filter(|(id, name)| !id.is_empty() && !name.is_empty())
+        .collect();
+
+    Ok(ids
+        .into_iter()
+        .map(|id| {
+            let name = names.get(&id).cloned().unwrap_or_else(|| id.clone());
+            ChannelMembership { id, name }
+        })
+        .collect())
+}
+
 fn extract_channel_metadata(e: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "channel_id": extract_d_tag(e),
