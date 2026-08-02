@@ -138,8 +138,8 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          git fetch origin main
-          CURRENT_MAIN="$(git rev-parse origin/main)"
+          # actions/checkout leaves no origin/main tracking ref, so ask the API.
+          CURRENT_MAIN="$(gh api "repos/${REPO}/commits/main" --jq '.sha')"
           if [[ "$SHA" != "$CURRENT_MAIN" ]]; then
             echo "Skipping stale Sprig publish for $SHA; main is $CURRENT_MAIN"
             exit 0
