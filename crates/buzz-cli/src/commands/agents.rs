@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::agent_management::{build_create, build_update, CreateAgentDraft, UpdateAgentDraft};
 use crate::client::BuzzClient;
+use crate::commands::channels::ChannelMembership;
 use crate::error::CliError;
 use crate::validate::{read_or_stdin, validate_hex64};
 use crate::{AgentsCmd, ChannelAddPolicyArg, ReasoningEffortArg, RespondToArg};
@@ -18,6 +19,11 @@ struct ProfileDraft<'a> {
     channel_add_policy: ChannelAddPolicyArg,
     description: Option<&'a str>,
     capabilities: &'a [&'a str],
+    /// Channels the agent is a member of, resolved from its own kind:39002
+    /// memberships. Clients read this to decide whether the agent is
+    /// mentionable for a given viewer, so an empty list reads as "shared with
+    /// nobody" rather than "unknown".
+    channels: &'a [ChannelMembership],
 }
 
 fn validate_profile_text(field: &str, value: &str, max_chars: usize) -> Result<String, CliError> {
@@ -73,8 +79,8 @@ fn build_profile_content(draft: ProfileDraft<'_>) -> Result<serde_json::Value, C
         "respond_to_allowlist": [],
         "channel_add_policy": draft.channel_add_policy.to_wire(),
         "description": description,
-        "channels": [],
-        "channel_ids": [],
+        "channels": draft.channels.iter().map(|c| &c.name).collect::<Vec<_>>(),
+        "channel_ids": draft.channels.iter().map(|c| &c.id).collect::<Vec<_>>(),
         "capabilities": capabilities,
         "status": "online",
     }))
@@ -93,6 +99,9 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             capabilities,
         } => {
             let capability_refs: Vec<&str> = capabilities.iter().map(String::as_str).collect();
+            // Resolved live rather than passed in: the agent is the only party
+            // that can sign its own profile, and it already knows its channels.
+            let channels = crate::commands::channels::my_channel_memberships(client).await?;
             let content = build_profile_content(ProfileDraft {
                 display_name: &display_name,
                 agent_type: &agent_type,
@@ -102,6 +111,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                 channel_add_policy,
                 description: description.as_deref(),
                 capabilities: &capability_refs,
+                channels: &channels,
             })?;
             let builder = nostr::EventBuilder::new(
                 nostr::Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
@@ -381,6 +391,10 @@ mod profile_tests {
             channel_add_policy: ChannelAddPolicyArg::OwnerOnly,
             description: Some("General-purpose coding agent with read-only ERP access"),
             capabilities: &["general", "erp-read-only"],
+            channels: &[ChannelMembership {
+                id: "3f1c0f5e-0000-4000-8000-000000000001".into(),
+                name: "general".into(),
+            }],
         })
         .unwrap();
 
@@ -392,8 +406,14 @@ mod profile_tests {
         assert_eq!(content["respond_to"], "anyone");
         assert_eq!(content["channel_add_policy"], "owner_only");
         assert_eq!(content["status"], "online");
-        assert_eq!(content["channels"], serde_json::json!([]));
-        assert_eq!(content["channel_ids"], serde_json::json!([]));
+        // Clients gate mention eligibility on these two: an agent that publishes
+        // an empty list is shared with nobody, which is how a member agent went
+        // missing from everyone else's @ menu.
+        assert_eq!(content["channels"], serde_json::json!(["general"]));
+        assert_eq!(
+            content["channel_ids"],
+            serde_json::json!(["3f1c0f5e-0000-4000-8000-000000000001"])
+        );
         assert_eq!(
             content["capabilities"],
             serde_json::json!(["general", "erp-read-only"])
@@ -411,6 +431,7 @@ mod profile_tests {
             channel_add_policy: ChannelAddPolicyArg::OwnerOnly,
             description: None,
             capabilities: &[],
+            channels: &[],
         });
 
         assert!(invalid.is_err());

@@ -13,6 +13,55 @@ use crate::commands::channel_templates::{self, ChannelTemplateRecord, TemplateAg
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
 
+/// One channel the signing identity belongs to.
+pub struct ChannelMembership {
+    /// Channel UUID, as it appears in the kind:39002 `d` tag.
+    pub id: String,
+    /// Channel name from kind:39000, or the id when metadata is missing.
+    pub name: String,
+}
+
+/// Channels the signing identity is a member of, newest metadata wins.
+///
+/// Resolved the same way `channels list --member` does: kind:39002 by `#p`,
+/// then kind:39000 for the names.
+pub async fn my_channel_memberships(
+    client: &BuzzClient,
+) -> Result<Vec<ChannelMembership>, CliError> {
+    let my_pk = client.keys().public_key().to_hex();
+    let member_events = client
+        .query_paginated(serde_json::json!({"kinds": [39002], "#p": [my_pk]}), 500)
+        .await?;
+    let ids: Vec<String> = member_events
+        .iter()
+        .map(extract_d_tag)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let metadata = client
+        .query_paginated(
+            serde_json::json!({"kinds": [39000], "#d": ids.clone()}),
+            500,
+        )
+        .await?;
+    let names: std::collections::HashMap<String, String> = metadata
+        .iter()
+        .map(|e| (extract_d_tag(e), extract_tag_value(e, "name")))
+        .filter(|(id, name)| !id.is_empty() && !name.is_empty())
+        .collect();
+
+    Ok(ids
+        .into_iter()
+        .map(|id| {
+            let name = names.get(&id).cloned().unwrap_or_else(|| id.clone());
+            ChannelMembership { id, name }
+        })
+        .collect())
+}
+
 fn extract_channel_metadata(e: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "channel_id": extract_d_tag(e),
@@ -1001,6 +1050,28 @@ pub async fn cmd_remove_channel_member(
     Ok(())
 }
 
+/// The signing identity's own kind:10100 profile body, or an empty object.
+async fn fetch_own_profile(client: &BuzzClient) -> Result<serde_json::Value, CliError> {
+    let events = client
+        .query_paginated(
+            serde_json::json!({
+                "kinds": [buzz_sdk::kind::KIND_AGENT_PROFILE],
+                "authors": [client.keys().public_key().to_hex()],
+                "limit": 1,
+            }),
+            1,
+        )
+        .await?;
+    let body = events
+        .first()
+        .and_then(|e| e.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(body)
+}
+
 /// Set the channel addition policy — sign and submit a kind:10100 (agent profile) event.
 pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(), CliError> {
     match policy {
@@ -1032,7 +1103,13 @@ pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(),
         }
     }
 
-    let content = serde_json::json!({ "channel_add_policy": policy }).to_string();
+    // kind:10100 is replaceable, so publishing a lone policy field deletes the
+    // rest of the profile — name, respond_to, channel_ids and all. The agent
+    // keeps working and simply stops being mentionable, which reads as a client
+    // bug rather than as the last policy change. Merge into what is published.
+    let mut content = fetch_own_profile(client).await?;
+    content["channel_add_policy"] = serde_json::json!(policy);
+    let content = content.to_string();
     use nostr::{EventBuilder, Kind};
     let builder = EventBuilder::new(
         Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
