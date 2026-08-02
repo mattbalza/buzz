@@ -114,26 +114,39 @@ fn emit_runtime_lifecycle(
     }
 }
 
+/// Read the NIP-OA owner attestation from a systemd credential file or the
+/// legacy environment variable. The file source takes precedence so deployed
+/// bridge services do not need to expose the attestation in `/proc/*/environ`.
+pub(crate) fn auth_tag_value() -> Option<String> {
+    if let Ok(path) = std::env::var("BUZZ_AUTH_TAG_FILE") {
+        match std::fs::read_to_string(path) {
+            Ok(value) if !value.trim().is_empty() => return Some(value.trim().to_string()),
+            Ok(_) => tracing::warn!("BUZZ_AUTH_TAG_FILE is empty"),
+            Err(error) => tracing::warn!(%error, "failed to read BUZZ_AUTH_TAG_FILE"),
+        }
+    }
+    std::env::var("BUZZ_AUTH_TAG")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
 /// Resolve the agent's owner pubkey at startup.
 ///
 /// Priority:
-/// 1. `BUZZ_AUTH_TAG` env var — NIP-OA attestation signed by the owner.
+/// 1. NIP-OA attestation signed by the owner, loaded by [`auth_tag_value`].
 ///    Verified against the agent's own pubkey to extract the owner pubkey.
 /// 2. `--agent-owner` CLI flag / `BUZZ_ACP_AGENT_OWNER` env var.
 fn resolve_agent_owner(config: &Config) -> Option<String> {
-    // Try BUZZ_AUTH_TAG first (NIP-OA attestation).
-    if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-        if !auth_tag.is_empty() {
-            let agent_pk = config.keys.public_key();
-            match buzz_sdk::nip_oa::verify_auth_tag(&auth_tag, &agent_pk) {
-                Ok(owner_pk) => {
-                    let owner_hex = owner_pk.to_hex().to_ascii_lowercase();
-                    tracing::info!("owner resolved from BUZZ_AUTH_TAG: {owner_hex}");
-                    return Some(owner_hex);
-                }
-                Err(e) => {
-                    tracing::warn!("BUZZ_AUTH_TAG verification failed: {e} — falling back");
-                }
+    if let Some(auth_tag) = auth_tag_value() {
+        let agent_pk = config.keys.public_key();
+        match buzz_sdk::nip_oa::verify_auth_tag(&auth_tag, &agent_pk) {
+            Ok(owner_pk) => {
+                let owner_hex = owner_pk.to_hex().to_ascii_lowercase();
+                tracing::info!("owner resolved from NIP-OA auth tag: {owner_hex}");
+                return Some(owner_hex);
+            }
+            Err(e) => {
+                tracing::warn!("NIP-OA auth tag verification failed: {e} — falling back");
             }
         }
     }
@@ -142,9 +155,6 @@ fn resolve_agent_owner(config: &Config) -> Option<String> {
     config.agent_owner.clone()
 }
 
-/// Cache for the agent's owner pubkey.
-///
-/// Owner is now provided via `--agent-owner` config flag (no REST lookup).
 /// Cache for the agent's owner pubkey + sibling lookups.
 ///
 /// Siblings are other agents whose NIP-OA auth tag proves the same owner.
@@ -221,34 +231,15 @@ async fn is_owner_or_sibling(
 /// and `Allowlist` accept the owner and same-owner siblings; `Allowlist`
 /// additionally accepts the explicit external pubkey list.
 ///
-/// # DM policy (`is_dm`, `dm_policy`)
-///
-/// Clients auto-p-tag every DM participant, so in a DM *any* participant's
-/// message looks like a mention and may fire a turn. `dm_policy` adds an
-/// independent boundary so deployments can keep channels open while making
-/// DMs exact-owner-only or disabling them. The normal `respond_to` gate still
-/// applies after the DM-specific gate. Callers must resolve `is_dm`
-/// fail-closed: unknown channel type ⇒ treat as DM.
+/// DM policy is intentionally enforced separately by
+/// [`dm_policy_allows_author`] before control commands or this global gate.
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
     author: &str,
-    is_dm: bool,
-    dm_policy: DmPolicy,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
 ) -> bool {
-    if is_dm {
-        match dm_policy {
-            DmPolicy::Disabled => return false,
-            DmPolicy::OwnerOnly => {
-                if owner_cache.get().is_none_or(|owner| author != owner) {
-                    return false;
-                }
-            }
-            DmPolicy::Anyone => {}
-        }
-    }
     match respond_to {
         RespondTo::Anyone => true,
         RespondTo::Nobody => false,
@@ -258,6 +249,67 @@ async fn author_allowed(
                 || is_owner_or_sibling(author, owner_cache, rest_client).await
         }
     }
+}
+
+/// Apply the DM-specific author boundary independently of the global author
+/// policy. Call this immediately after self-event filtering and before any
+/// control command or other event side effect.
+fn dm_policy_allows_author(
+    dm_policy: DmPolicy,
+    is_dm: bool,
+    author: &str,
+    owner_cache: &OwnerCache,
+) -> bool {
+    if !is_dm {
+        return true;
+    }
+    match dm_policy {
+        DmPolicy::Anyone => true,
+        DmPolicy::Disabled => false,
+        DmPolicy::OwnerOnly => owner_cache.get().is_some_and(|owner| author == owner),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreDispatchAction {
+    DropDm,
+    Shutdown,
+    Cancel,
+    Rotate,
+    Continue,
+}
+
+/// Classify an inbound event before any control signal, queue insertion,
+/// context creation, or model activation. Keeping the DM boundary and owner
+/// control recognition in one function makes their ordering testable.
+fn pre_dispatch_action(
+    dm_policy: DmPolicy,
+    is_dm: bool,
+    event: &nostr::Event,
+    kind_u32: u32,
+    agent_pubkey_hex: &str,
+    owner_cache: &OwnerCache,
+) -> PreDispatchAction {
+    let author = event.pubkey.to_hex();
+    if !dm_policy_allows_author(dm_policy, is_dm, &author, owner_cache) {
+        return PreDispatchAction::DropDm;
+    }
+
+    let is_owner = owner_cache.get().is_some_and(|owner| author == owner);
+    if !is_owner {
+        return PreDispatchAction::Continue;
+    }
+
+    for (command, action) in [
+        ("!shutdown", PreDispatchAction::Shutdown),
+        ("!cancel", PreDispatchAction::Cancel),
+        ("!rotate", PreDispatchAction::Rotate),
+    ] {
+        if is_owner_control_command(event, kind_u32, command, agent_pubkey_hex) {
+            return action;
+        }
+    }
+    PreDispatchAction::Continue
 }
 
 /// Resolve whether `channel_id` is a DM, for the inbound author gate.
@@ -1336,10 +1388,8 @@ async fn tokio_main() -> Result<()> {
     let pubkey_hex = config.keys.public_key().to_hex();
 
     // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
+    let relay_auth_tag: Option<nostr::Tag> =
+        auth_tag_value().and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
 
     let mut relay =
         HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
@@ -2031,113 +2081,82 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
-                            // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
-                            let is_shutdown = is_owner_control_command(
+                            // Resolve DM metadata fail-closed, then classify the
+                            // event before controls, matching, queueing, context,
+                            // or model activation.
+                            let author = buzz_event.event.pubkey.to_hex();
+                            let is_dm =
+                                is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await;
+                            let pre_dispatch = pre_dispatch_action(
+                                config.dm_policy,
+                                is_dm,
                                 &buzz_event.event,
                                 kind_u32,
-                                "!shutdown",
                                 &pubkey_hex,
+                                &owner_cache,
                             );
-                            if is_shutdown {
-                                let owner = owner_cache.get();
-                                if let Some(owner) = owner {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
+                            match pre_dispatch {
+                                PreDispatchAction::DropDm => {
+                                    tracing::debug!(
+                                        channel_id = %buzz_event.channel_id,
+                                        author,
+                                        is_dm,
+                                        dm_policy = %config.dm_policy,
+                                        "DM policy — dropping event before side effects"
+                                    );
+                                    continue;
+                                }
+                                PreDispatchAction::Shutdown => {
+                                    tracing::info!(
+                                        channel_id = %buzz_event.channel_id,
+                                        sender = %author,
+                                        "shutdown command from owner — exiting gracefully"
+                                    );
+                                    let _ = shutdown_tx.send(());
+                                    continue;
+                                }
+                                PreDispatchAction::Cancel => {
+                                    let fired = signal_in_flight_task(
+                                        &mut pool,
+                                        buzz_event.channel_id,
+                                        ControlSignal::Cancel,
+                                    );
+                                    if !fired {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "!cancel received but no in-flight task — no-op"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                PreDispatchAction::Rotate => {
+                                    let fired = signal_in_flight_task(
+                                        &mut pool,
+                                        buzz_event.channel_id,
+                                        ControlSignal::Rotate,
+                                    );
+                                    if fired {
                                         tracing::info!(
                                             channel_id = %buzz_event.channel_id,
-                                            sender = %buzz_event.event.pubkey.to_hex(),
-                                            "shutdown command from owner — exiting gracefully"
+                                            "!rotate received — cancelling in-flight turn and rotating session"
                                         );
-                                        let _ = shutdown_tx.send(());
-                                        continue;
-                                    }
-                                }
-                                // Not from owner — fall through to normal prompt handling.
-                                // Don't drop it — it's a regular message that happens to
-                                // contain "!shutdown" from a non-owner.
-                            }
-
-                            // Mirrors !shutdown: kind:9, content "!cancel", from
-                            // owner, mentions THIS agent. Must be BEFORE
-                            // queue.push() — the event content is moved by push.
-                            //
-                            // Mode-independent: !cancel fires regardless of
-                            // --multiple-event-handling. It is explicit user
-                            // intent, not an automatic policy decision.
-                            let is_cancel = is_owner_control_command(
-                                &buzz_event.event,
-                                kind_u32,
-                                "!cancel",
-                                &pubkey_hex,
-                            );
-                            if is_cancel {
-                                if let Some(owner) = owner_cache.get() {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
-                                        let fired = signal_in_flight_task(
-                                            &mut pool,
-                                            buzz_event.channel_id,
-                                            ControlSignal::Cancel,
+                                    } else {
+                                        let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            invalidated,
+                                            "!rotate received — invalidated idle channel session(s)"
                                         );
-                                        if !fired {
-                                            tracing::warn!(
-                                                channel_id = %buzz_event.channel_id,
-                                                "!cancel received but no in-flight task — no-op"
-                                            );
-                                        }
-                                        continue; // consume event — do NOT push to queue
                                     }
+                                    continue;
                                 }
-                                // Not from owner — fall through to normal prompt handling.
-                            }
-
-                            // Mirrors !shutdown / !cancel: kind:9, content
-                            // "!rotate", from owner, mentions THIS agent.
-                            //
-                            // Rotation is explicit owner intent to start the
-                            // next turn in this channel with a fresh ACP
-                            // session. It is consumed by the harness and never
-                            // forwarded to the agent. If a turn is in-flight,
-                            // cancel it, drop its triggering batch, and
-                            // invalidate the channel session when the task
-                            // returns. If idle, invalidate the cached channel
-                            // session immediately. Queued future events remain
-                            // queued and will create a fresh session on dispatch.
-                            let is_rotate = is_owner_control_command(
-                                &buzz_event.event,
-                                kind_u32,
-                                "!rotate",
-                                &pubkey_hex,
-                            );
-                            if is_rotate {
-                                if let Some(owner) = owner_cache.get() {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
-                                        let fired = signal_in_flight_task(
-                                            &mut pool,
-                                            buzz_event.channel_id,
-                                            ControlSignal::Rotate,
-                                        );
-                                        if fired {
-                                            tracing::info!(
-                                                channel_id = %buzz_event.channel_id,
-                                                "!rotate received — cancelling in-flight turn and rotating session"
-                                            );
-                                        } else {
-                                            let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
-                                            tracing::info!(
-                                                channel_id = %buzz_event.channel_id,
-                                                invalidated,
-                                                "!rotate received — invalidated idle channel session(s)"
-                                            );
-                                        }
-                                        continue; // consume event — do NOT push to queue
-                                    }
-                                }
-                                // Not from owner — fall through to normal prompt handling.
+                                PreDispatchAction::Continue => {}
                             }
 
                             // Coarse security policy: drop events from disallowed
                             // authors before they reach subscription rules or the
-                            // agent. Must be AFTER !shutdown (owner can always
-                            // shut down regardless of gate mode).
+                            // agent. DM-specific authorization has already run
+                            // before control-command handling above.
                             //
                             // Both OwnerOnly and Allowlist accept events from
                             // "siblings" — pubkeys whose agent_owner_pubkey
@@ -2147,17 +2166,10 @@ async fn tokio_main() -> Result<()> {
                             // it never revokes same-owner team bots.
                             {
                                 let author = buzz_event.event.pubkey.to_hex();
-                                // DM hardening: resolve channel type (fail-closed
-                                // to DM) so allowlist/anyone modes cannot be
-                                // exercised by non-owner authors inside DMs.
-                                let is_dm =
-                                    is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await;
                                 let allowed = author_allowed(
                                     &config.respond_to,
                                     &config.respond_to_allowlist,
                                     &author,
-                                    is_dm,
-                                    config.dm_policy,
                                     &owner_cache,
                                     &ctx.rest_client,
                                 )
@@ -4193,27 +4205,21 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
         command: config.mcp_command.clone(),
         args: vec![],
         env: {
-            let mut env = vec![
-                EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
-                    value: config.relay_url.clone(),
-                },
-                EnvVar {
+            let mut env = vec![EnvVar {
+                name: "BUZZ_RELAY_URL".into(),
+                value: config.relay_url.clone(),
+            }];
+            if !config.isolate_mcp_identity {
+                env.push(EnvVar {
                     name: "BUZZ_PRIVATE_KEY".into(),
                     // bech32 encoding of a valid secret key is infallible.
-                    // Panic here is correct: injecting a bogus secret would cause
-                    // delayed, hard-to-diagnose agent failures downstream.
                     value: config
                         .keys
                         .secret_key()
                         .to_bech32()
                         .expect("secret key bech32 encoding should never fail"),
-                },
-            ];
-            // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
-            // so the MCP server can attach it to every signed event.
-            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-                if !auth_tag.is_empty() {
+                });
+                if let Some(auth_tag) = auth_tag_value() {
                     env.push(EnvVar {
                         name: "BUZZ_AUTH_TAG".into(),
                         value: auth_tag,
@@ -4257,6 +4263,24 @@ fn append_allowlisted_mcp_env(env: &mut Vec<EnvVar>) {
             });
         if !valid {
             tracing::warn!("ignoring invalid BUZZ_ACP_MCP_ENV_VARS entry");
+            continue;
+        }
+        if matches!(
+            name,
+            "BUZZ_PRIVATE_KEY"
+                | "BUZZ_PRIVATE_KEY_FILE"
+                | "BUZZ_AUTH_TAG"
+                | "BUZZ_AUTH_TAG_FILE"
+                | "BUZZ_AGENT_IDENTITY_FILE"
+                | "CLAUDE_CODE_OAUTH_TOKEN"
+                | "ANTHROPIC_API_KEY"
+                | "CLAUDE_API_KEY"
+                | "OPENAI_API_KEY"
+                | "CODEX_HOME"
+                | "ERP_CONNECTOR_KEY_FILE"
+                | "ERP_CONNECTOR_API_KEY"
+        ) {
+            tracing::warn!(name, "refusing to forward credential to MCP");
             continue;
         }
         if env.iter().any(|entry| entry.name == name) {
@@ -4311,13 +4335,22 @@ mod owner_control_command_tests {
 
     fn make_event(kind: u32, content: &str, p_hex: Option<&str>) -> nostr::Event {
         let keys = Keys::generate();
+        make_event_with_keys(&keys, kind, content, p_hex)
+    }
+
+    fn make_event_with_keys(
+        keys: &Keys,
+        kind: u32,
+        content: &str,
+        p_hex: Option<&str>,
+    ) -> nostr::Event {
         let tags = match p_hex {
             Some(hex) => vec![Tag::parse(["p", hex]).expect("p tag")],
             None => vec![],
         };
         EventBuilder::new(Kind::Custom(kind as u16), content)
             .tags(tags)
-            .sign_with_keys(&keys)
+            .sign_with_keys(keys)
             .unwrap()
     }
 
@@ -4351,6 +4384,60 @@ mod owner_control_command_tests {
             "!rotate",
             &agent
         ));
+    }
+
+    #[test]
+    fn disabled_dm_dispatch_drops_controls_and_mentions_before_all_effects() {
+        let owner_keys = Keys::generate();
+        let owner = owner_keys.public_key().to_hex();
+        let agent = "ab".repeat(32);
+        let cache = OwnerCache::new(Some(owner));
+
+        for content in ["!shutdown", "!cancel", "!rotate", "ordinary request"] {
+            let event =
+                make_event_with_keys(&owner_keys, KIND_STREAM_MESSAGE, content, Some(&agent));
+            assert_eq!(
+                pre_dispatch_action(
+                    DmPolicy::Disabled,
+                    true,
+                    &event,
+                    KIND_STREAM_MESSAGE,
+                    &agent,
+                    &cache,
+                ),
+                PreDispatchAction::DropDm,
+                "{content:?} must not reach controls, queueing, context, or model activation",
+            );
+        }
+    }
+
+    #[test]
+    fn durable_channel_dispatch_preserves_owner_controls_and_mentions() {
+        let owner_keys = Keys::generate();
+        let owner = owner_keys.public_key().to_hex();
+        let agent = "ab".repeat(32);
+        let cache = OwnerCache::new(Some(owner));
+
+        for (content, expected) in [
+            ("!shutdown", PreDispatchAction::Shutdown),
+            ("!cancel", PreDispatchAction::Cancel),
+            ("!rotate", PreDispatchAction::Rotate),
+            ("ordinary request", PreDispatchAction::Continue),
+        ] {
+            let event =
+                make_event_with_keys(&owner_keys, KIND_STREAM_MESSAGE, content, Some(&agent));
+            assert_eq!(
+                pre_dispatch_action(
+                    DmPolicy::Disabled,
+                    false,
+                    &event,
+                    KIND_STREAM_MESSAGE,
+                    &agent,
+                    &cache,
+                ),
+                expected,
+            );
+        }
     }
 
     #[test]
@@ -4494,8 +4581,6 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 SIBLING,
-                false,
-                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4513,8 +4598,6 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 EXTERNAL,
-                false,
-                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4532,8 +4615,6 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 STRANGER,
-                false,
-                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4551,8 +4632,6 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 OWNER,
-                false,
-                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4573,8 +4652,6 @@ mod author_gate_tests {
                 &RespondTo::OwnerOnly,
                 &HashSet::new(),
                 STRANGER,
-                false,
-                DmPolicy::Anyone,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4592,8 +4669,6 @@ mod author_gate_tests {
                     &RespondTo::OwnerOnly,
                     &HashSet::new(),
                     who,
-                    false,
-                    DmPolicy::Anyone,
                     &cache,
                     &dummy_rest_client()
                 )
@@ -4608,78 +4683,54 @@ mod author_gate_tests {
     // DM policy is separate from the channel author gate. Production can
     // therefore use respond_to=anyone for channels and owner-only for DMs.
 
-    #[tokio::test]
-    async fn test_dm_owner_only_accepts_exact_owner() {
+    #[test]
+    fn test_dm_owner_only_accepts_exact_owner() {
         let cache = cache_with_sibling();
         assert!(
-            author_allowed(
-                &RespondTo::Anyone,
-                &HashSet::new(),
-                OWNER,
-                true,
-                DmPolicy::OwnerOnly,
-                &cache,
-                &dummy_rest_client()
-            )
-            .await,
+            dm_policy_allows_author(DmPolicy::OwnerOnly, true, OWNER, &cache),
             "the exact configured owner must fire a turn under owner-only DM policy"
         );
     }
 
-    #[tokio::test]
-    async fn test_dm_owner_only_rejects_sibling_and_stranger() {
+    #[test]
+    fn test_dm_owner_only_rejects_sibling_and_stranger() {
         let cache = cache_with_sibling();
         for (who, label) in [(SIBLING, "sibling"), (STRANGER, "stranger")] {
             assert!(
-                !author_allowed(
-                    &RespondTo::Anyone,
-                    &HashSet::new(),
-                    who,
-                    true,
-                    DmPolicy::OwnerOnly,
-                    &cache,
-                    &dummy_rest_client()
-                )
-                .await,
+                !dm_policy_allows_author(DmPolicy::OwnerOnly, true, who, &cache),
                 "a {label} must not pass the exact-owner DM gate"
             );
         }
     }
 
-    #[tokio::test]
-    async fn test_dm_disabled_rejects_even_owner() {
+    #[test]
+    fn test_dm_disabled_rejects_every_author() {
         let cache = cache_with_sibling();
-        assert!(
-            !author_allowed(
-                &RespondTo::Anyone,
-                &HashSet::new(),
-                OWNER,
-                true,
+        for author in [OWNER, SIBLING, STRANGER] {
+            assert!(!dm_policy_allows_author(
                 DmPolicy::Disabled,
-                &cache,
-                &dummy_rest_client()
-            )
-            .await,
-            "disabled DM policy must drop everything"
-        );
+                true,
+                author,
+                &cache
+            ));
+        }
     }
 
-    #[tokio::test]
-    async fn test_dm_anyone_preserves_global_author_policy() {
+    #[test]
+    fn test_dm_anyone_and_durable_channels_pass_dm_boundary() {
         let cache = cache_with_sibling();
-        assert!(
-            author_allowed(
-                &RespondTo::Anyone,
-                &HashSet::new(),
-                STRANGER,
-                true,
-                DmPolicy::Anyone,
-                &cache,
-                &dummy_rest_client()
-            )
-            .await,
-            "the backward-compatible DM default must defer to respond_to=anyone"
-        );
+        assert!(dm_policy_allows_author(
+            DmPolicy::Anyone,
+            true,
+            STRANGER,
+            &cache
+        ));
+        assert!(dm_policy_allows_author(
+            DmPolicy::Disabled,
+            false,
+            STRANGER,
+            &cache
+        ));
     }
 
     // ── is_dm_channel resolution ──────────────────────────────────────────
@@ -4801,23 +4852,15 @@ mod author_gate_tests {
         let discovered = relay::merge_discovered_channels(vec![id], &serde_json::json!([]));
         let channel_info = resolver(discovered);
         let owner_cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
 
         let is_dm = is_dm_channel(id, &channel_info).await;
         assert!(is_dm, "unknown startup metadata must fail closed as DM");
-        assert!(
-            !author_allowed(
-                &RespondTo::Allowlist,
-                &allowlist,
-                EXTERNAL,
-                is_dm,
-                DmPolicy::OwnerOnly,
-                &owner_cache,
-                &dummy_rest_client(),
-            )
-            .await,
-            "an external author must not pass when startup discovery omitted metadata"
-        );
+        assert!(!dm_policy_allows_author(
+            DmPolicy::OwnerOnly,
+            is_dm,
+            EXTERNAL,
+            &owner_cache,
+        ));
     }
 
     #[tokio::test]
@@ -5041,6 +5084,7 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            isolate_mcp_identity: false,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -5081,7 +5125,10 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn session_new_mcp_server_has_required_fields() {
+    fn session_new_mcp_server_forwards_relay_identity_by_default() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config = test_config();
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
@@ -5095,30 +5142,54 @@ mod build_mcp_servers_tests {
         );
         assert!(
             names.contains(&"BUZZ_PRIVATE_KEY"),
-            "missing BUZZ_PRIVATE_KEY; got {names:?}"
+            "default compatibility contract omitted BUZZ_PRIVATE_KEY: {names:?}"
         );
     }
 
     #[test]
-    fn session_new_mcp_server_forwards_buzz_auth_tag() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn session_new_mcp_server_forwards_buzz_auth_tag_by_default() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
-        let config = test_config();
+        let servers = build_mcp_servers(&test_config());
+        std::env::remove_var("BUZZ_AUTH_TAG");
+
+        assert!(servers[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_AUTH_TAG" && entry.value == "test-attestation-tag"
+        }));
+    }
+
+    #[test]
+    fn session_new_mcp_server_isolates_relay_identity_when_configured() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
+        let mut config = test_config();
+        config.isolate_mcp_identity = true;
         let servers = build_mcp_servers(&config);
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
-        let auth_tag_env = server.env.iter().find(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(
-            auth_tag_env.is_some(),
-            "BUZZ_AUTH_TAG should be forwarded when set"
+            !server.env.iter().any(|entry| entry.name == "BUZZ_AUTH_TAG"),
+            "owner attestation credential crossed the ACP/MCP boundary"
         );
-        assert_eq!(auth_tag_env.unwrap().value, "test-attestation-tag");
+        assert!(
+            !server
+                .env
+                .iter()
+                .any(|entry| entry.name == "BUZZ_PRIVATE_KEY"),
+            "private signing key crossed the isolated ACP/MCP boundary"
+        );
     }
 
     #[test]
     fn session_new_mcp_server_skips_empty_buzz_auth_tag() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var("BUZZ_AUTH_TAG", "");
         let config = test_config();
         let servers = build_mcp_servers(&config);
@@ -5131,30 +5202,31 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn session_new_mcp_server_forwards_only_allowlisted_environment() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var(
-            "BUZZ_ACP_MCP_ENV_VARS",
-            "ERP_CONNECTOR_KEY_FILE,ERP_MCP_ACCESS_MODE",
-        );
-        std::env::set_var("ERP_CONNECTOR_KEY_FILE", "/run/keys/erp");
-        std::env::set_var("ERP_MCP_ACCESS_MODE", "read-only");
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("BUZZ_ACP_MCP_ENV_VARS", "ERP_MCP_BROKER_SOCKET,AGENT_LABEL");
+        std::env::set_var("ERP_MCP_BROKER_SOCKET", "/run/buzz-erp-mcp/erp.sock");
+        std::env::set_var("AGENT_LABEL", "erp");
         std::env::set_var("UNRELATED_SECRET", "must-not-leak");
 
-        let servers = build_mcp_servers(&test_config());
+        let mut config = test_config();
+        config.isolate_mcp_identity = true;
+        let servers = build_mcp_servers(&config);
 
         std::env::remove_var("BUZZ_ACP_MCP_ENV_VARS");
-        std::env::remove_var("ERP_CONNECTOR_KEY_FILE");
-        std::env::remove_var("ERP_MCP_ACCESS_MODE");
+        std::env::remove_var("ERP_MCP_BROKER_SOCKET");
+        std::env::remove_var("AGENT_LABEL");
         std::env::remove_var("UNRELATED_SECRET");
 
         let server = &servers[0];
         assert!(server.env.iter().any(|entry| {
-            entry.name == "ERP_CONNECTOR_KEY_FILE" && entry.value == "/run/keys/erp"
+            entry.name == "ERP_MCP_BROKER_SOCKET" && entry.value == "/run/buzz-erp-mcp/erp.sock"
         }));
         assert!(server
             .env
             .iter()
-            .any(|entry| { entry.name == "ERP_MCP_ACCESS_MODE" && entry.value == "read-only" }));
+            .any(|entry| { entry.name == "AGENT_LABEL" && entry.value == "erp" }));
         assert!(!server
             .env
             .iter()
@@ -5162,8 +5234,70 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn session_new_mcp_server_cannot_allowlist_credentials() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let variables = [
+            (
+                "BUZZ_ACP_MCP_ENV_VARS",
+                "ERP_MCP_BROKER_SOCKET,BUZZ_PRIVATE_KEY,BUZZ_PRIVATE_KEY_FILE,BUZZ_AUTH_TAG,BUZZ_AUTH_TAG_FILE,BUZZ_AGENT_IDENTITY_FILE,CLAUDE_CODE_OAUTH_TOKEN,ANTHROPIC_API_KEY,CLAUDE_API_KEY,OPENAI_API_KEY,CODEX_HOME,ERP_CONNECTOR_KEY_FILE,ERP_CONNECTOR_API_KEY",
+            ),
+            ("ERP_MCP_BROKER_SOCKET", "/run/buzz-erp-mcp/codex.sock"),
+            ("BUZZ_PRIVATE_KEY", "must-not-cross"),
+            ("BUZZ_PRIVATE_KEY_FILE", "/run/credentials/nostr.key"),
+            ("BUZZ_AUTH_TAG", "must-not-cross"),
+            ("BUZZ_AUTH_TAG_FILE", "/run/credentials/auth-tag"),
+            ("BUZZ_AGENT_IDENTITY_FILE", "/etc/scalarly/identity"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "must-not-cross"),
+            ("ANTHROPIC_API_KEY", "must-not-cross"),
+            ("CLAUDE_API_KEY", "must-not-cross"),
+            ("OPENAI_API_KEY", "must-not-cross"),
+            ("CODEX_HOME", "/var/lib/buzz-codex/.codex"),
+            ("ERP_CONNECTOR_KEY_FILE", "/etc/scalarly/connector"),
+            ("ERP_CONNECTOR_API_KEY", "must-not-cross"),
+        ];
+        for (name, value) in variables {
+            std::env::set_var(name, value);
+        }
+
+        let mut config = test_config();
+        config.isolate_mcp_identity = true;
+        let servers = build_mcp_servers(&config);
+
+        for (name, _) in variables {
+            std::env::remove_var(name);
+        }
+        let env = &servers[0].env;
+        assert!(env.iter().any(|entry| {
+            entry.name == "ERP_MCP_BROKER_SOCKET" && entry.value == "/run/buzz-erp-mcp/codex.sock"
+        }));
+        for secret in [
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_PRIVATE_KEY_FILE",
+            "BUZZ_AUTH_TAG",
+            "BUZZ_AUTH_TAG_FILE",
+            "BUZZ_AGENT_IDENTITY_FILE",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_HOME",
+            "ERP_CONNECTOR_KEY_FILE",
+            "ERP_CONNECTOR_API_KEY",
+        ] {
+            assert!(
+                env.iter().all(|entry| entry.name != secret),
+                "{secret} crossed the MCP boundary"
+            );
+        }
+    }
+
+    #[test]
     fn session_new_mcp_server_rejects_invalid_allowlist_names() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var(
             "BUZZ_ACP_MCP_ENV_VARS",
             "VALID_NAME,../../etc/passwd,NAME=VALUE,lowercase",
@@ -5188,7 +5322,9 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn test_display_name_set_is_forwarded_to_mcp_server() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "Duncan");
         let config = test_config();
         let servers = build_mcp_servers(&config);
@@ -5207,7 +5343,9 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn test_display_name_unset_omits_the_key_entirely() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
         let config = test_config();
         let servers = build_mcp_servers(&config);
@@ -5225,7 +5363,9 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn test_display_name_empty_omits_the_key_entirely() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "");
         let config = test_config();
         let servers = build_mcp_servers(&config);
@@ -5320,6 +5460,7 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            isolate_mcp_identity: false,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

@@ -113,6 +113,9 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: sprig-rolling-publish
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -135,26 +138,109 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          git fetch origin main
+          CURRENT_MAIN="$(git rev-parse origin/main)"
+          if [[ "$SHA" != "$CURRENT_MAIN" ]]; then
+            echo "Skipping stale Sprig publish for $SHA; main is $CURRENT_MAIN"
+            exit 0
+          fi
           TAG="sprig-latest"
           TITLE="Sprig (rolling)"
           NOTES="Rolling Linux build of Sprig (all-in-one buzz-acp + buzz-agent + buzz-dev-mcp), tracking \`main\` (\`${SHA}\`)."
 
-          # `gh release edit` fails with "release not found" until the rolling
-          # release exists, so the first run on any repo — a new fork, a
-          # re-created repo, or this one before `sprig-latest` was ever cut —
-          # cannot bootstrap it. Create it on demand, then edit as before so
-          # the title/notes still track the current SHA.
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" \
+          # GitHub ignores target_commitish when a tag already exists. Move the
+          # rolling lightweight tag explicitly, then verify its exact object.
+          if gh api "repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${REPO}/git/refs/tags/${TAG}" \
+              -f sha="$SHA" \
+              -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${REPO}/git/refs" \
+              -f ref="refs/tags/${TAG}" \
+              -f sha="$SHA" >/dev/null
+          fi
+          REMOTE_TAG_SHA="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha')"
+          test "$REMOTE_TAG_SHA" = "$SHA"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
               --prerelease \
-              --target "$SHA" \
               --title "$TITLE" \
               --notes "$NOTES"
-          gh release edit "$TAG" \
-            --prerelease \
-            --title "$TITLE" \
-            --notes "$NOTES"
-          gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" \
+              --prerelease \
+              --verify-tag \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi
+
+          # The content-addressed bundle is immutable. The manifest is uploaded
+          # last and acts as the atomic pointer consumers verify before install.
+          BUNDLE_TMP="${RUNNER_TEMP}/sprig-bundle.tar.gz"
+          tar -C dist -czf "$BUNDLE_TMP" .
+          BUNDLE_SHA256="$(sha256sum "$BUNDLE_TMP" | cut -d' ' -f1)"
+          BUNDLE_NAME="sprig-bundle-${SHA}-${BUNDLE_SHA256}.tar.gz"
+          BUNDLE_PATH="${RUNNER_TEMP}/${BUNDLE_NAME}"
+          mv "$BUNDLE_TMP" "$BUNDLE_PATH"
+
+          if gh release view "$TAG" --json assets --jq '.assets[].name' \
+            | grep -Fqx "$BUNDLE_NAME"; then
+            VERIFY_DIR="$(mktemp -d)"
+            gh release download "$TAG" --pattern "$BUNDLE_NAME" --dir "$VERIFY_DIR"
+            test "$(sha256sum "$VERIFY_DIR/$BUNDLE_NAME" | cut -d' ' -f1)" = "$BUNDLE_SHA256"
+          else
+            gh release upload "$TAG" "$BUNDLE_PATH"
+          fi
+
+          PREVIOUS_BUNDLE=""
+          PREVIOUS_MANIFEST_DIR="$(mktemp -d)"
+          if gh release download "$TAG" --pattern sprig-manifest.json \
+            --dir "$PREVIOUS_MANIFEST_DIR" 2>/dev/null; then
+            if ! PREVIOUS_BUNDLE="$(jq -r \
+              'if .schema_version == 1 and (.bundle | type == "string") then .bundle else empty end' \
+              "$PREVIOUS_MANIFEST_DIR/sprig-manifest.json")"; then
+              PREVIOUS_BUNDLE=""
+            fi
+          fi
+
+          MANIFEST_PATH="${RUNNER_TEMP}/sprig-manifest.json"
+          jq -n \
+            --arg git_sha "$SHA" \
+            --arg bundle "$BUNDLE_NAME" \
+            --arg sha256 "$BUNDLE_SHA256" \
+            '{schema_version: 1, git_sha: $git_sha, bundle: $bundle, sha256: $sha256}' \
+            > "$MANIFEST_PATH"
+          gh release upload "$TAG" "$MANIFEST_PATH" --clobber
+
+          VERIFY_DIR="$(mktemp -d)"
+          gh release download "$TAG" --pattern sprig-manifest.json --dir "$VERIFY_DIR"
+          test "$(jq -r '.git_sha' "$VERIFY_DIR/sprig-manifest.json")" = "$SHA"
+          test "$(jq -r '.bundle' "$VERIFY_DIR/sprig-manifest.json")" = "$BUNDLE_NAME"
+          test "$(jq -r '.sha256' "$VERIFY_DIR/sprig-manifest.json")" = "$BUNDLE_SHA256"
+
+          # Retain the active bundle plus one rollback bundle. Cleanup happens
+          # only after the manifest pointer has been downloaded and verified.
+          RELEASE_ID="$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.id')"
+          ASSET_INDEX="$(mktemp)"
+          gh api --paginate "repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | select(.name | startswith("sprig-bundle-")) | [.created_at, (.id | tostring), .name] | @tsv' \
+            | sort -r > "$ASSET_INDEX"
+          CURRENT_BUNDLE_PREFIX="sprig-bundle-${SHA}-"
+          ROLLBACK_BUNDLE=""
+          if [[ -n "$PREVIOUS_BUNDLE" && "$PREVIOUS_BUNDLE" != "$BUNDLE_NAME" ]] \
+            && [[ "$PREVIOUS_BUNDLE" != "$CURRENT_BUNDLE_PREFIX"* ]] \
+            && awk -F '\t' -v previous="$PREVIOUS_BUNDLE" '$3 == previous { found = 1 } END { exit !found }' "$ASSET_INDEX"; then
+            ROLLBACK_BUNDLE="$PREVIOUS_BUNDLE"
+          else
+            ROLLBACK_BUNDLE="$(awk -F '\t' -v prefix="$CURRENT_BUNDLE_PREFIX" \
+              'index($3, prefix) != 1 { print $3; exit }' "$ASSET_INDEX")"
+          fi
+          while IFS=$'\t' read -r _created_at asset_id asset_name; do
+            if [[ "$asset_name" != "$BUNDLE_NAME" && "$asset_name" != "$ROLLBACK_BUNDLE" ]]; then
+              gh api --method DELETE "repos/${REPO}/releases/assets/${asset_id}"
+            fi
+          done < "$ASSET_INDEX"
 
   publish-tag:
     name: Publish tagged release
