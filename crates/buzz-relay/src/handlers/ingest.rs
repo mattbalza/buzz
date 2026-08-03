@@ -173,6 +173,7 @@ fn channel_creation_allowed(
     policy: ChannelCreatePolicy,
     relay_role: Option<&str>,
     configured_owner: Option<&str>,
+    configured_creators: &[String],
     author: &str,
     is_huddle: bool,
 ) -> bool {
@@ -182,6 +183,11 @@ fn channel_creation_allowed(
             is_huddle
                 || (relay_role == Some("owner")
                     && configured_owner.is_some_and(|owner| author == owner))
+                // Service accounts named in config may provision channels
+                // unattended. Membership is still required, so removing the
+                // account from the workspace revokes the grant immediately.
+                || (relay_role.is_some()
+                    && configured_creators.iter().any(|creator| creator == author))
         }
     }
 }
@@ -2246,6 +2252,7 @@ async fn ingest_event_inner(
                 state.config.channel_create_policy,
                 relay_role,
                 state.config.relay_owner_pubkey.as_deref(),
+                &state.config.channel_creator_pubkeys,
                 &sender_hex,
                 is_huddle,
             ) {
@@ -2858,6 +2865,7 @@ mod tests {
             ChannelCreatePolicy::OwnerOnly,
             Some("owner"),
             Some("aria-pubkey"),
+            &[],
             "aria-pubkey",
             false,
         ));
@@ -2865,6 +2873,7 @@ mod tests {
             ChannelCreatePolicy::OwnerOnly,
             Some("admin"),
             Some("aria-pubkey"),
+            &[],
             "aria-pubkey",
             false,
         ));
@@ -2872,6 +2881,7 @@ mod tests {
             ChannelCreatePolicy::OwnerOnly,
             None,
             Some("aria-pubkey"),
+            &[],
             "aria-pubkey",
             false,
         ));
@@ -2879,6 +2889,7 @@ mod tests {
             ChannelCreatePolicy::OwnerOnly,
             Some("owner"),
             Some("aria-pubkey"),
+            &[],
             "different-owner-pubkey",
             false,
         ));
@@ -2886,6 +2897,7 @@ mod tests {
             ChannelCreatePolicy::OwnerOnly,
             Some("owner"),
             None,
+            &[],
             "aria-pubkey",
             false,
         ));
@@ -2893,7 +2905,44 @@ mod tests {
             ChannelCreatePolicy::AnyMember,
             None,
             None,
+            &[],
             "member-pubkey",
+            false,
+        ));
+    }
+
+    #[test]
+    fn owner_only_admits_configured_service_creators_that_are_members() {
+        use crate::config::ChannelCreatePolicy;
+
+        let creators = vec!["bot-pubkey".to_string()];
+
+        // A listed service account with any membership role may create.
+        assert!(channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            Some("member"),
+            Some("aria-pubkey"),
+            &creators,
+            "bot-pubkey",
+            false,
+        ));
+        // Listing alone is not enough — the account must still be a member, so
+        // removing it from the workspace revokes the grant without a redeploy.
+        assert!(!channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            None,
+            Some("aria-pubkey"),
+            &creators,
+            "bot-pubkey",
+            false,
+        ));
+        // Everyone else is still refused.
+        assert!(!channel_creation_allowed(
+            ChannelCreatePolicy::OwnerOnly,
+            Some("member"),
+            Some("aria-pubkey"),
+            &creators,
+            "other-pubkey",
             false,
         ));
     }
@@ -2955,6 +3004,7 @@ mod tests {
             ChannelCreatePolicy::OwnerOnly,
             Some("member"),
             Some("aria-pubkey"),
+            &[],
             "member-pubkey",
             true,
         ));

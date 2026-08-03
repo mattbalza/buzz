@@ -44,6 +44,30 @@ fn parse_channel_create_policy(raw: Option<&str>) -> Result<ChannelCreatePolicy,
     }
 }
 
+/// Parse a comma-separated list of 64-char hex pubkeys, lowercased and deduped.
+///
+/// An invalid entry is a hard config error rather than a skipped entry: silently
+/// dropping a pubkey silently revokes whatever the list grants, and the symptom
+/// (a permission denial in production) points nowhere near the typo.
+fn parse_pubkey_list(var: &str, raw: &str) -> Result<Vec<String>, ConfigError> {
+    let mut pubkeys = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim().to_lowercase();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.len() != 64 || !entry.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ConfigError::InvalidValue(format!(
+                "{var} entry is not a valid 64-char hex pubkey: {entry:?}"
+            )));
+        }
+        if !pubkeys.contains(&entry) {
+            pubkeys.push(entry);
+        }
+    }
+    Ok(pubkeys)
+}
+
 fn validate_channel_create_policy(
     policy: ChannelCreatePolicy,
     relay_owner_pubkey: Option<&str>,
@@ -200,6 +224,20 @@ pub struct Config {
     /// When set, this pubkey is automatically bootstrapped into `relay_members`
     /// with the `owner` role on first startup.
     pub relay_owner_pubkey: Option<String>,
+
+    /// Service pubkeys additionally allowed to create durable channels while
+    /// `channel_create_policy` is `OwnerOnly`.
+    ///
+    /// `OwnerOnly` admits exactly one human identity, which is correct for
+    /// people and wrong for an unattended provisioner: a bot that creates a
+    /// channel per customer cannot be the workspace owner. Each listed pubkey
+    /// must still hold a `relay_members` row, so removing the bot from the
+    /// workspace revokes the grant without a redeploy.
+    ///
+    /// Set via `BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS` as a comma-separated list
+    /// of 64-char hex pubkeys. Empty (the default) changes nothing. Invalid
+    /// entries are rejected at startup, never skipped.
+    pub channel_creator_pubkeys: Vec<String>,
 
     /// Canonical HTTP origin of the deployment-global operator API.
     ///
@@ -637,6 +675,20 @@ impl Config {
             });
         validate_channel_create_policy(channel_create_policy, relay_owner_pubkey.as_deref())?;
 
+        let channel_creator_pubkeys = match std::env::var("BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS") {
+            Ok(raw) => parse_pubkey_list("BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS", &raw)?,
+            Err(_) => Vec::new(),
+        };
+        if !channel_creator_pubkeys.is_empty()
+            && channel_create_policy == ChannelCreatePolicy::AnyMember
+        {
+            warn!(
+                "BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS is set but \
+                 BUZZ_RELAY_CHANNEL_CREATE_POLICY is any-member — the list grants nothing \
+                 because every member may already create channels."
+            );
+        }
+
         // Note: intentionally not prefixed with BUZZ_ — same relay-identity
         // config family as RELAY_OWNER_PUBKEY. Comma-separated 64-char hex
         // pubkeys. Unlike RELAY_OWNER_PUBKEY (warn-and-ignore), an invalid
@@ -649,25 +701,7 @@ impl Config {
             .transpose()?;
 
         let relay_operator_pubkeys = match std::env::var("RELAY_OPERATOR_PUBKEYS") {
-            Ok(raw) => {
-                let mut pubkeys = Vec::new();
-                for entry in raw.split(',') {
-                    let entry = entry.trim().to_lowercase();
-                    if entry.is_empty() {
-                        continue;
-                    }
-                    let valid = entry.len() == 64 && entry.chars().all(|c| c.is_ascii_hexdigit());
-                    if !valid {
-                        return Err(ConfigError::InvalidValue(format!(
-                            "RELAY_OPERATOR_PUBKEYS entry is not a valid 64-char hex pubkey: {entry:?}"
-                        )));
-                    }
-                    if !pubkeys.contains(&entry) {
-                        pubkeys.push(entry);
-                    }
-                }
-                pubkeys
-            }
+            Ok(raw) => parse_pubkey_list("RELAY_OPERATOR_PUBKEYS", &raw)?,
             Err(_) => Vec::new(),
         };
         if !relay_operator_pubkeys.is_empty() && relay_operator_api_origin.is_none() {
@@ -1006,6 +1040,7 @@ impl Config {
             mesh,
             mesh_demo_echo,
             relay_owner_pubkey,
+            channel_creator_pubkeys,
             relay_operator_api_origin,
             relay_operator_pubkeys,
             allow_nip_oa_auth,
@@ -1078,6 +1113,10 @@ mod tests {
         assert!(
             config.relay_operator_pubkeys.is_empty(),
             "relay_operator_pubkeys should default empty (provisioning disabled)"
+        );
+        assert!(
+            config.channel_creator_pubkeys.is_empty(),
+            "channel_creator_pubkeys should default empty (no service grants)"
         );
         assert!(
             !config.allow_nip_oa_auth,
@@ -1423,6 +1462,36 @@ mod tests {
             result,
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC")
+        ));
+    }
+
+    #[test]
+    fn channel_creator_pubkeys_parse_dedupe_and_normalize() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var(
+            "BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS",
+            " CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC ,,cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
+        let config = Config::from_env().expect("config");
+        std::env::remove_var("BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS");
+
+        assert_eq!(
+            config.channel_creator_pubkeys,
+            vec!["cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string()]
+        );
+    }
+
+    #[test]
+    fn channel_creator_pubkeys_invalid_entry_is_error() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS", "deadbeef");
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref msg))
+                if msg.contains("BUZZ_RELAY_CHANNEL_CREATOR_PUBKEYS")
         ));
     }
 
