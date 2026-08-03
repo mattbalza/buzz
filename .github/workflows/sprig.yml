@@ -138,6 +138,16 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+
+          # A bare `test a = b` under `set -e` aborts the job with no output at
+          # all — two publish failures were debugged from nothing but "exit 1".
+          assert_eq() {
+            if [[ "$2" != "$3" ]]; then
+              echo "::error::$1: expected '$3', got '$2'"
+              exit 1
+            fi
+          }
+
           # actions/checkout leaves no origin/main tracking ref, so ask the API.
           CURRENT_MAIN="$(gh api "repos/${REPO}/commits/main" --jq '.sha')"
           if [[ "$SHA" != "$CURRENT_MAIN" ]]; then
@@ -159,8 +169,18 @@ jobs:
               -f ref="refs/tags/${TAG}" \
               -f sha="$SHA" >/dev/null
           fi
-          REMOTE_TAG_SHA="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha')"
-          test "$REMOTE_TAG_SHA" = "$SHA"
+          # The refs API is read-after-write eventually consistent: a read issued
+          # immediately after the PATCH can still be served the old object, which
+          # is what failed the 2026-08-02 and 2026-08-03 publishes ~2s in. Retry
+          # briefly rather than treating a stale replica as a corrupted tag.
+          REMOTE_TAG_SHA=""
+          for attempt in 1 2 3 4 5; do
+            REMOTE_TAG_SHA="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha')"
+            [[ "$REMOTE_TAG_SHA" == "$SHA" ]] && break
+            echo "Tag ${TAG} still reads ${REMOTE_TAG_SHA} (attempt ${attempt}); retrying"
+            sleep 3
+          done
+          assert_eq "rolling tag ${TAG}" "$REMOTE_TAG_SHA" "$SHA"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" \
@@ -188,7 +208,8 @@ jobs:
             | grep -Fqx "$BUNDLE_NAME"; then
             VERIFY_DIR="$(mktemp -d)"
             gh release download "$TAG" --pattern "$BUNDLE_NAME" --dir "$VERIFY_DIR"
-            test "$(sha256sum "$VERIFY_DIR/$BUNDLE_NAME" | cut -d' ' -f1)" = "$BUNDLE_SHA256"
+            assert_eq "bundle $BUNDLE_NAME" \
+              "$(sha256sum "$VERIFY_DIR/$BUNDLE_NAME" | cut -d' ' -f1)" "$BUNDLE_SHA256"
           else
             gh release upload "$TAG" "$BUNDLE_PATH"
           fi
@@ -215,9 +236,12 @@ jobs:
 
           VERIFY_DIR="$(mktemp -d)"
           gh release download "$TAG" --pattern sprig-manifest.json --dir "$VERIFY_DIR"
-          test "$(jq -r '.git_sha' "$VERIFY_DIR/sprig-manifest.json")" = "$SHA"
-          test "$(jq -r '.bundle' "$VERIFY_DIR/sprig-manifest.json")" = "$BUNDLE_NAME"
-          test "$(jq -r '.sha256' "$VERIFY_DIR/sprig-manifest.json")" = "$BUNDLE_SHA256"
+          assert_eq "manifest git_sha" \
+            "$(jq -r '.git_sha' "$VERIFY_DIR/sprig-manifest.json")" "$SHA"
+          assert_eq "manifest bundle" \
+            "$(jq -r '.bundle' "$VERIFY_DIR/sprig-manifest.json")" "$BUNDLE_NAME"
+          assert_eq "manifest sha256" \
+            "$(jq -r '.sha256' "$VERIFY_DIR/sprig-manifest.json")" "$BUNDLE_SHA256"
 
           # Retain the active bundle plus one rollback bundle. Cleanup happens
           # only after the manifest pointer has been downloaded and verified.
