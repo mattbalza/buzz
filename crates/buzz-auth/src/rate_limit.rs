@@ -62,6 +62,8 @@ pub enum LimitType {
     ApiCalls,
     /// All WebSocket events (broader than `Messages`).
     WsEvents,
+    /// Agent observer telemetry admitted before signature and route validation.
+    ObserverFrames,
     /// Concurrent WebSocket connections from a single IP address.
     IpConnections,
 }
@@ -73,6 +75,7 @@ impl LimitType {
             Self::Messages => "msg",
             Self::ApiCalls => "api",
             Self::WsEvents => "ws",
+            Self::ObserverFrames => "observer",
             Self::IpConnections => "conn",
         }
     }

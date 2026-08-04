@@ -21,6 +21,11 @@ export type RemoteSections = {
   eventId: string;
 };
 
+export type RemoteSectionsResult =
+  | { status: "found"; remote: RemoteSections }
+  | { status: "absent" }
+  | { status: "error" };
+
 async function decryptAndParse(
   event: RelayEvent,
 ): Promise<RemoteSections | null> {
@@ -46,7 +51,7 @@ export class ChannelSectionSyncManager {
     this.pubkey = pubkey;
   }
 
-  async fetchRemoteSections(): Promise<RemoteSections | null> {
+  async fetchRemoteSections(): Promise<RemoteSectionsResult> {
     try {
       const events = await relayClient.fetchEvents({
         kinds: [KIND_CHANNEL_SECTIONS],
@@ -54,18 +59,19 @@ export class ChannelSectionSyncManager {
         "#d": [D_TAG],
         limit: 1,
       });
-      if (events.length === 0) return null;
-      if (events[0].pubkey !== this.pubkey) return null;
+      if (events.length === 0) return { status: "absent" };
+      if (events[0].pubkey !== this.pubkey) return { status: "error" };
       const result = await decryptAndParse(events[0]);
       if (result) {
         this.lastRemoteCreatedAt = Math.max(
           this.lastRemoteCreatedAt,
           result.createdAt,
         );
+        return { status: "found", remote: result };
       }
-      return result;
+      return { status: "error" };
     } catch {
-      return null;
+      return { status: "error" };
     }
   }
 

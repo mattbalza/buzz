@@ -23,6 +23,7 @@ import { useChannelSortPreference } from "@/features/sidebar/lib/useChannelSortP
 import { useSidebarScrollLock } from "@/features/sidebar/lib/useSidebarScrollLock";
 import { isSidebarBackgroundTarget } from "@/features/sidebar/lib/sidebarBackgroundTarget";
 import { useUnreadOverflow } from "@/features/sidebar/lib/useUnreadOverflow";
+import { useScalarlyDefaultChannelSections } from "@/features/sidebar/lib/useScalarlyDefaultChannelSections";
 import {
   CreateSectionDialog,
   DeleteSectionAlertDialog,
@@ -347,6 +348,8 @@ export function AppSidebar({
   const {
     sections: channelSections,
     assignments: channelAssignments,
+    isReady: areChannelSectionsReady,
+    seedEmptyStore,
     createSection,
     renameSection,
     deleteSection,
@@ -387,6 +390,9 @@ export function AppSidebar({
     () => channels.filter((channel) => channel.channelType === "stream"),
     [channels],
   );
+
+  // biome-ignore format: keep compact to stay within file size limit
+  useScalarlyDefaultChannelSections({ channels, pubkey: currentPubkey, relayUrl: activeCommunity?.relayUrl, isReady: areChannelSectionsReady, isLoading, sectionCount: channelSections.length, seedEmptyStore });
 
   const sectionBuckets = React.useMemo(() => {
     const bySection: Record<string, Channel[]> = {};

@@ -3044,6 +3044,15 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
+/// Returns `true` for provider usage limits that cannot recover within this
+/// process by replaying the same prompt.
+fn is_usage_limit_error(error: &acp::AcpError) -> bool {
+    let acp::AcpError::AgentError { message, .. } = error else {
+        return false;
+    };
+    message.contains("You've hit your weekly limit")
+}
+
 /// Spawn a task that posts a user-visible failure notice to the relay.
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
@@ -3177,6 +3186,16 @@ fn handle_prompt_result(
                 let content = "⚠️ I couldn't process the last request: authentication failed. \
                     Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
                     and then re-send."
+                    .to_string();
+                spawn_failure_notice(rest_client, &batch, content);
+            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_usage_limit_error(e))
+            {
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch immediately — non-retryable weekly usage limit"
+                );
+                let content = "⚠️ I couldn't process the last request: this agent has reached its weekly usage limit. Please use another agent or re-send after the limit resets."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
             } else if let Some(dead) = queue.requeue(batch) {
@@ -6493,13 +6512,29 @@ mod error_outcome_emission_tests {
         );
     }
 
-    // ── auth error dead-letter behavior ────────────────────────────────────
+    #[test]
+    fn is_usage_limit_error_matches_claude_weekly_limit() {
+        let e = acp::AcpError::AgentError {
+            code: -32603,
+            message: "Internal error: You've hit your weekly limit · resets Aug 6, 11am (UTC)"
+                .to_string(),
+        };
+        assert!(
+            is_usage_limit_error(&e),
+            "a weekly provider limit cannot recover by retrying the same prompt"
+        );
+    }
 
-    /// An auth-class `PromptOutcome::Error` must dead-letter immediately
-    /// (the batch is never requeued) so the user sees a re-auth hint at once
-    /// rather than after 10 futile retries.
-    #[tokio::test]
-    async fn auth_error_dead_letters_immediately_without_requeueing() {
+    #[test]
+    fn is_usage_limit_error_rejects_generic_usage_credit_errors() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Usage credits required for 1M context".to_string(),
+        };
+        assert!(!is_usage_limit_error(&e));
+    }
+
+    async fn queued_counts_after_agent_error(error: acp::AcpError) -> (usize, usize) {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -6516,154 +6551,86 @@ mod error_outcome_emission_tests {
             cancel_reason: None,
         };
 
-        let auth_error = acp::AcpError::AgentError {
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(error),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+        (
+            queue.pending_channels(),
+            queue.queued_event_count(&channel_id),
+        )
+    }
+
+    /// An auth-class error cannot self-repair and must not consume retries.
+    #[tokio::test]
+    async fn auth_error_dead_letters_immediately_without_requeueing() {
+        let error = acp::AcpError::AgentError {
             code: -32000,
             message: "API Error: 401 OAuth access token has expired. Re-authenticate to continue."
                 .to_string(),
         };
-
-        let agent = dummy_agent(0).await;
-        let mut pool = AgentPool::from_slots(vec![None]);
-        let task_id = pool.join_set.spawn(async {}).id();
-        pool.task_map_mut().insert(
-            task_id,
-            crate::pool::TaskMeta {
-                agent_index: 0,
-                channel_id: None,
-                turn_id: "test-turn-id".to_string(),
-                recoverable_batch: None,
-                control_tx: None,
-                steer_tx: None,
-            },
-        );
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let config = test_config();
-        let mut heartbeat_in_flight = false;
-        let removed_channels = std::collections::HashSet::new();
-        let mut crash_history = vec![SlotCircuit {
-            crash_times: Vec::new(),
-            open_until: None,
-            respawn_in_flight: false,
-        }];
-        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
-        let mut respawn_tasks = tokio::task::JoinSet::new();
-        let result = PromptResult {
-            agent,
-            source: PromptSource::Channel(channel_id),
-            turn_id: "test-turn-id".to_string(),
-            outcome: PromptOutcome::Error(auth_error),
-            batch: Some(batch),
-        };
-        handle_prompt_result(
-            &mut pool,
-            &mut queue,
-            &config,
-            result,
-            &mut heartbeat_in_flight,
-            &removed_channels,
-            &mut crash_history,
-            &respawn_tx,
-            &mut respawn_tasks,
-            None,
-            None,
-        );
-
-        // The batch must not be requeued: pending_channels returns 0.
-        assert_eq!(
-            queue.pending_channels(),
-            0,
-            "auth error must dead-letter immediately — batch must not be requeued"
-        );
-        assert_eq!(
-            queue.queued_event_count(&channel_id),
-            0,
-            "auth error must dead-letter immediately — no events should be pending"
-        );
+        assert_eq!(queued_counts_after_agent_error(error).await, (0, 0));
     }
 
-    /// A non-auth application error (e.g. usage credits) must still follow the
-    /// standard requeue path so today's behavior is unchanged.
+    /// A generic application error may recover and retains the normal retry path.
     #[tokio::test]
     async fn non_auth_application_error_is_requeued() {
-        let keys = nostr::Keys::generate();
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
-            .sign_with_keys(&keys)
-            .unwrap();
-        let channel_id = uuid::Uuid::new_v4();
-        let batch = FlushBatch {
-            channel_id,
-            events: vec![BatchEvent {
-                event,
-                prompt_tag: "test".into(),
-                received_at: std::time::Instant::now(),
-            }],
-            cancelled_events: vec![],
-            cancel_reason: None,
-        };
-
-        // Usage-credits error — AgentError but NOT an auth error.
-        let usage_error = acp::AcpError::AgentError {
+        let error = acp::AcpError::AgentError {
             code: -32000,
             message: "Usage credits required for 1M context".to_string(),
         };
+        assert_eq!(queued_counts_after_agent_error(error).await, (1, 1));
+    }
 
-        let agent = dummy_agent(0).await;
-        let mut pool = AgentPool::from_slots(vec![None]);
-        let task_id = pool.join_set.spawn(async {}).id();
-        pool.task_map_mut().insert(
-            task_id,
-            crate::pool::TaskMeta {
-                agent_index: 0,
-                channel_id: None,
-                turn_id: "test-turn-id".to_string(),
-                recoverable_batch: None,
-                control_tx: None,
-                steer_tx: None,
-            },
-        );
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let config = test_config();
-        let mut heartbeat_in_flight = false;
-        let removed_channels = std::collections::HashSet::new();
-        let mut crash_history = vec![SlotCircuit {
-            crash_times: Vec::new(),
-            open_until: None,
-            respawn_in_flight: false,
-        }];
-        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
-        let mut respawn_tasks = tokio::task::JoinSet::new();
-        let result = PromptResult {
-            agent,
-            source: PromptSource::Channel(channel_id),
-            turn_id: "test-turn-id".to_string(),
-            outcome: PromptOutcome::Error(usage_error),
-            batch: Some(batch),
+    #[tokio::test]
+    async fn weekly_usage_limit_dead_letters_immediately_without_requeueing() {
+        let error = acp::AcpError::AgentError {
+            code: -32603,
+            message: "Internal error: You've hit your weekly limit · resets Aug 6, 11am (UTC)"
+                .to_string(),
         };
-        handle_prompt_result(
-            &mut pool,
-            &mut queue,
-            &config,
-            result,
-            &mut heartbeat_in_flight,
-            &removed_channels,
-            &mut crash_history,
-            &respawn_tx,
-            &mut respawn_tasks,
-            None,
-            None,
-        );
-
-        // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
-        assert_eq!(
-            queue.pending_channels(),
-            1,
-            "non-auth application error must requeue the batch for retry"
-        );
-        assert_eq!(
-            queue.queued_event_count(&channel_id),
-            1,
-            "non-auth application error must preserve the event for retry"
-        );
+        assert_eq!(queued_counts_after_agent_error(error).await, (0, 0));
     }
 }
 

@@ -23,6 +23,8 @@ pub const NIP44_MIN_CONTENT_LEN: usize = 132;
 pub const NIP44_MAX_CONTENT_LEN: usize = 87_472;
 /// Maximum observer plaintext JSON size accepted by helpers.
 pub const OBSERVER_MAX_PLAINTEXT_LEN: usize = 65_535;
+/// Maximum observer telemetry admitted per agent and community each second.
+pub const OBSERVER_FRAMES_PER_SECOND: u64 = 100;
 
 /// Errors returned by observer payload encryption/decryption helpers.
 #[derive(Debug, Error)]

@@ -11,8 +11,8 @@ use buzz_core::kind::{
     KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
-    content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
-    OBSERVER_FRAME_TELEMETRY,
+    content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAMES_PER_SECOND,
+    OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -909,7 +909,7 @@ struct AgentObserverRoute {
     direction: AgentObserverDirection,
 }
 
-/// Check + bump the per-agent observer telemetry limit (100/sec window).
+/// Check + bump the per-agent observer telemetry limit.
 ///
 /// Observer frames are ephemeral, but the rejection is visible to the sender.
 /// Scope the counter by community so an agent key active in one tenant does not
@@ -931,7 +931,7 @@ fn observer_frame_rate_limited(
         false
     } else {
         *count += 1;
-        *count > 100
+        u64::from(*count) > OBSERVER_FRAMES_PER_SECOND
     }
 }
 
@@ -1060,7 +1060,9 @@ async fn handle_agent_observer_event(
             conn.send(RelayMessage::ok(
                 event_id_hex,
                 false,
-                "rate-limited: observer frame rate exceeded (100/sec per agent)",
+                &format!(
+                    "rate-limited: observer frame rate exceeded ({OBSERVER_FRAMES_PER_SECOND}/sec per agent)"
+                ),
             ));
             return;
         }
