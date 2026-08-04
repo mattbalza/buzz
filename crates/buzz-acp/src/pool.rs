@@ -103,6 +103,10 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<Uuid, String>,
+    /// Trusted browser activity generation for each live channel ACP session.
+    pub browser_activities: HashMap<Uuid, String>,
+    /// Root manager socket used for best-effort lifecycle cleanup.
+    pub browser_manager_socket: Option<String>,
 }
 
 impl SessionState {
@@ -125,6 +129,11 @@ impl SessionState {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
+        if let Some(activity_id) = self.browser_activities.remove(channel_id) {
+            if let Some(socket) = self.browser_manager_socket.as_deref() {
+                notify_browser_activity_ended(socket, &activity_id);
+            }
+        }
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -136,6 +145,19 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
         self.canvas_sections.clear();
+        if let Some(socket) = self.browser_manager_socket.as_deref() {
+            for activity_id in self.browser_activities.values() {
+                notify_browser_activity_ended(socket, activity_id);
+            }
+        }
+        self.browser_activities.clear();
+    }
+
+    pub fn ensure_browser_activity(&mut self, channel_id: Uuid) -> String {
+        self.browser_activities
+            .entry(channel_id)
+            .or_insert_with(|| Uuid::new_v4().simple().to_string())
+            .clone()
     }
 
     #[cfg(test)]
@@ -144,6 +166,7 @@ impl SessionState {
             || self.turn_counts.contains_key(channel_id)
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
+            || self.browser_activities.contains_key(channel_id)
     }
 }
 
@@ -500,6 +523,7 @@ impl ChannelInfoResolver {
 
 pub struct PromptContext {
     pub mcp_servers: Vec<McpServer>,
+    pub browser_mcp: Option<BrowserMcpConfig>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
     pub max_turn_duration: Duration,
@@ -552,6 +576,150 @@ pub struct PromptContext {
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
 }
+
+#[derive(Clone, Debug)]
+pub struct BrowserMcpConfig {
+    pub mode: String,
+    pub command: String,
+    pub manager_socket: Option<String>,
+    pub identity: String,
+    pub buzz_path: String,
+}
+
+impl BrowserMcpConfig {
+    pub fn from_env() -> Option<Self> {
+        let command = std::env::var("BUZZ_BROWSER_MCP_COMMAND")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let mode = std::env::var("BUZZ_BROWSER_MODE").unwrap_or_else(|_| "legacy".into());
+        if mode != "legacy" && mode != "ephemeral" {
+            panic!("BUZZ_BROWSER_MODE must be legacy or ephemeral");
+        }
+        let required = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| panic!("{name} is required when browser MCP is enabled"))
+        };
+        let manager_socket = if mode == "ephemeral" {
+            Some(required("BUZZ_BROWSER_MANAGER_SOCKET"))
+        } else {
+            None
+        };
+        if command.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            mode,
+            command,
+            manager_socket,
+            identity: required("BUZZ_BROWSER_IDENTITY"),
+            buzz_path: required("BUZZ_BROWSER_BUZZ_PATH"),
+        })
+    }
+}
+
+fn browser_mcp_server(
+    config: &BrowserMcpConfig,
+    activity_id: Option<&str>,
+    channel_id: Uuid,
+) -> McpServer {
+    let mut env = vec![crate::acp::EnvVar {
+        name: "BUZZ_BROWSER_MODE".into(),
+        value: config.mode.clone(),
+    }];
+    if let (Some(activity_id), Some(manager_socket)) = (activity_id, config.manager_socket.as_ref())
+    {
+        env.extend([
+            crate::acp::EnvVar {
+                name: "BUZZ_BROWSER_ACTIVITY_ID".into(),
+                value: activity_id.into(),
+            },
+            crate::acp::EnvVar {
+                name: "BUZZ_BROWSER_CHANNEL_ID".into(),
+                value: channel_id.to_string(),
+            },
+            crate::acp::EnvVar {
+                name: "BUZZ_BROWSER_MANAGER_SOCKET".into(),
+                value: manager_socket.clone(),
+            },
+        ]);
+    }
+    McpServer {
+        name: "browser".into(),
+        command: config.command.clone(),
+        args: vec![config.identity.clone(), config.buzz_path.clone()],
+        env,
+    }
+}
+
+#[cfg(unix)]
+fn browser_manager_request(
+    socket_path: &str,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(socket_path).map_err(|error| error.to_string())?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    writeln!(stream, "{request}").map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response)
+        .map_err(|error| error.to_string())?;
+    let value =
+        serde_json::from_str::<serde_json::Value>(&response).map_err(|error| error.to_string())?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("browser manager rejected request")
+            .to_string());
+    }
+    Ok(value)
+}
+
+#[cfg(unix)]
+fn register_browser_activity(
+    socket_path: &str,
+    activity_id: &str,
+    channel_id: Uuid,
+) -> Result<(), String> {
+    browser_manager_request(
+        socket_path,
+        &serde_json::json!({
+            "op": "register",
+            "activity_id": activity_id,
+            "context": {"channel_id": channel_id.to_string()},
+        }),
+    )
+    .map(|_| ())
+}
+
+#[cfg(unix)]
+fn notify_browser_activity_ended(socket_path: &str, activity_id: &str) {
+    let request = serde_json::json!({"op":"activity_ended", "activity_id":activity_id});
+    if let Err(error) = browser_manager_request(socket_path, &request) {
+        tracing::warn!(
+            activity_id,
+            %error,
+            "browser manager rejected activity end callback"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn register_browser_activity(
+    _socket_path: &str,
+    _activity_id: &str,
+    _channel_id: Uuid,
+) -> Result<(), String> {
+    Err("ephemeral browsers require Unix sockets".into())
+}
+
+#[cfg(not(unix))]
+fn notify_browser_activity_ended(_socket_path: &str, _activity_id: &str) {}
 
 impl AgentPool {
     /// Create a pool from pre-indexed slots (may contain None for failed startups).
@@ -875,6 +1043,7 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
     channel_name: Option<&str>,
+    session_mcp_servers: Vec<McpServer>,
 ) -> Result<String, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
@@ -899,11 +1068,17 @@ async fn create_session_and_apply_model(
         .as_deref()
         .map(|agent_name| compose_session_title(agent_name, channel_name));
 
+    let mcp_servers = ctx
+        .mcp_servers
+        .iter()
+        .cloned()
+        .chain(session_mcp_servers)
+        .collect();
     let resp = agent
         .acp
         .session_new_full(
             &ctx.cwd,
-            ctx.mcp_servers.clone(),
+            mcp_servers,
             session_new_system_prompt(
                 is_goose,
                 agent.protocol_version,
@@ -1551,15 +1726,49 @@ pub async fn run_prompt_task(
                 // agent in several channels doesn't produce identical session
                 // rows; `title_channel` comes from the single resolve above and
                 // is `None` for DM, unresolved, and unnamed channels.
-                match create_session_and_apply_model(
-                    &mut agent,
-                    &ctx,
-                    agent_core.as_deref(),
-                    agent_canvas.as_deref(),
-                    title_channel.as_deref(),
-                )
-                .await
-                {
+                let browser_servers = ctx
+                    .browser_mcp
+                    .as_ref()
+                    .map(|config| -> Result<Vec<McpServer>, AcpError> {
+                        if config.mode == "ephemeral" {
+                            let activity_id = agent.state.ensure_browser_activity(*cid);
+                            if agent.state.browser_manager_socket.is_none() {
+                                agent.state.browser_manager_socket = config.manager_socket.clone();
+                            }
+                            let manager_socket =
+                                config.manager_socket.as_deref().ok_or_else(|| {
+                                    AcpError::Protocol(
+                                        "ephemeral browser manager socket is missing".into(),
+                                    )
+                                })?;
+                            register_browser_activity(manager_socket, &activity_id, *cid).map_err(
+                                |error| {
+                                    AcpError::Protocol(format!(
+                                        "could not register browser activity: {error}"
+                                    ))
+                                },
+                            )?;
+                            Ok(vec![browser_mcp_server(config, Some(&activity_id), *cid)])
+                        } else {
+                            Ok(vec![browser_mcp_server(config, None, *cid)])
+                        }
+                    })
+                    .unwrap_or_else(|| Ok(Vec::new()));
+                let session_result = match browser_servers {
+                    Ok(browser_servers) => {
+                        create_session_and_apply_model(
+                            &mut agent,
+                            &ctx,
+                            agent_core.as_deref(),
+                            agent_canvas.as_deref(),
+                            title_channel.as_deref(),
+                            browser_servers,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match session_result {
                     Ok(sid) => {
                         tracing::info!(
                             target: "pool::session",
@@ -1604,7 +1813,9 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None, None).await {
+                match create_session_and_apply_model(&mut agent, &ctx, None, None, None, vec![])
+                    .await
+                {
                     Ok(sid) => {
                         tracing::info!(
                             target: "pool::session",
@@ -5196,6 +5407,95 @@ mod tests {
     }
 
     #[test]
+    fn browser_activity_is_stable_until_channel_session_is_invalidated() {
+        let channel = Uuid::new_v4();
+        let mut state = SessionState::default();
+        let first = state.ensure_browser_activity(channel);
+        let repeated = state.ensure_browser_activity(channel);
+        assert_eq!(first, repeated);
+        assert_eq!(first.len(), 32);
+
+        state.invalidate_channel(&channel);
+        let rotated = state.ensure_browser_activity(channel);
+        assert_ne!(first, rotated);
+    }
+
+    #[test]
+    fn activity_browser_mcp_is_scoped_and_contains_no_secret() {
+        let config = BrowserMcpConfig {
+            mode: "ephemeral".into(),
+            command: "/usr/local/libexec/buzz-agent/buzz_browser_mcp.py".into(),
+            manager_socket: Some("/run/buzz-browser-manager/manager.sock".into()),
+            identity: "codex".into(),
+            buzz_path: "/usr/local/bin/buzz".into(),
+        };
+        let channel = Uuid::new_v4();
+        let server = browser_mcp_server(&config, Some("a123456789012345"), channel);
+        assert_eq!(server.name, "browser");
+        assert_eq!(server.args, vec!["codex", "/usr/local/bin/buzz"]);
+        let env: HashMap<_, _> = server
+            .env
+            .iter()
+            .map(|entry| (&entry.name, &entry.value))
+            .collect();
+        assert_eq!(
+            env.get(&"BUZZ_BROWSER_ACTIVITY_ID".to_string())
+                .map(|value| value.as_str()),
+            Some("a123456789012345")
+        );
+        let channel_string = channel.to_string();
+        assert_eq!(
+            env.get(&"BUZZ_BROWSER_CHANNEL_ID".to_string())
+                .map(|value| value.as_str()),
+            Some(channel_string.as_str())
+        );
+        assert!(!server
+            .env
+            .iter()
+            .any(|entry| entry.name.contains("KEY") || entry.name.contains("TOKEN")));
+        assert!(!server
+            .env
+            .iter()
+            .any(|entry| entry.name == "BUZZ_BROWSER_THREAD_ROOT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_bridge_registers_activity_and_channel_before_session_creation() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let socket_path = std::path::PathBuf::from(format!("/tmp/bbm-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&socket_path).expect("bind test manager socket");
+        let activity_id = "activity-codex-0001";
+        let channel_id = Uuid::new_v4();
+        let expected_channel = channel_id.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept registration");
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().expect("clone stream"))
+                .read_line(&mut request)
+                .expect("read registration");
+            let request: serde_json::Value =
+                serde_json::from_str(&request).expect("registration JSON");
+            assert_eq!(request["op"], "register");
+            assert_eq!(request["activity_id"], activity_id);
+            assert_eq!(request["context"]["channel_id"], expected_channel);
+            writeln!(stream, r#"{{"ok":true,"result":{{"state":"registered"}}}}"#)
+                .expect("write response");
+        });
+
+        register_browser_activity(
+            socket_path.to_str().expect("socket path"),
+            activity_id,
+            channel_id,
+        )
+        .expect("register activity");
+        server.join().expect("manager test thread");
+        std::fs::remove_file(socket_path).expect("remove test socket");
+    }
+
+    #[test]
     fn test_invalidate_heartbeat_clears_session_and_turn_count() {
         let (mut s, ch_a, ch_b) = make_state();
         s.invalidate(&PromptSource::Heartbeat);
@@ -6267,6 +6567,7 @@ mod tests {
         use crate::relay::RestClient;
         PromptContext {
             mcp_servers: vec![],
+            browser_mcp: None,
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),
