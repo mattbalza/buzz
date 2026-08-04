@@ -591,13 +591,27 @@ fn request_rejection_message(sub_id: Option<&str>, reason: &str) -> String {
     }
 }
 
+fn event_admission_limit_type(kind: u32, is_agent: bool) -> LimitType {
+    if is_agent && kind == buzz_core::kind::KIND_AGENT_OBSERVER_FRAME {
+        LimitType::ObserverFrames
+    } else {
+        LimitType::Messages
+    }
+}
+
 async fn enforce_ws_admission(
     msg: &ClientMessage,
     conn: &ConnectionState,
     state: &AppState,
 ) -> bool {
-    let is_event = matches!(msg, ClientMessage::Event(_));
-    if !is_event && !matches!(msg, ClientMessage::Req { .. } | ClientMessage::Count { .. }) {
+    let event_kind = match msg {
+        ClientMessage::Event(event) => Some(event.kind.as_u16() as u32),
+        _ => None,
+    };
+    if !matches!(
+        msg,
+        ClientMessage::Event(_) | ClientMessage::Req { .. } | ClientMessage::Count { .. }
+    ) {
         return true;
     }
 
@@ -629,18 +643,21 @@ async fn enforce_ws_admission(
         return false;
     }
 
-    if is_event {
-        let message_limit = if is_agent {
-            limits.agent_standard_messages_per_min
+    if let Some(kind) = event_kind {
+        let limit_type = event_admission_limit_type(kind, is_agent);
+        let (window_secs, message_limit) = if matches!(limit_type, LimitType::ObserverFrames) {
+            (1, buzz_core::observer::OBSERVER_FRAMES_PER_SECOND)
+        } else if is_agent {
+            (60, limits.agent_standard_messages_per_min)
         } else {
-            limits.human_messages_per_min
+            (60, limits.human_messages_per_min)
         };
         let message_result = crate::admission::check_principal(
             state.admission_rate_limiter.as_ref(),
             &conn.tenant,
             &pubkey,
-            LimitType::Messages,
-            60,
+            limit_type,
+            window_secs,
             message_limit,
         )
         .await;
@@ -783,6 +800,25 @@ mod tests {
         let notice: serde_json::Value =
             serde_json::from_str(&request_rejection_message(None, reason)).expect("parse NOTICE");
         assert_eq!(notice, serde_json::json!(["NOTICE", reason]));
+    }
+
+    #[test]
+    fn event_admission_class_keeps_every_publisher_on_a_message_quota() {
+        assert_eq!(
+            event_admission_limit_type(buzz_core::kind::KIND_AGENT_OBSERVER_FRAME, true),
+            LimitType::ObserverFrames,
+            "authenticated agent observer telemetry uses its early dedicated quota"
+        );
+        assert_eq!(
+            event_admission_limit_type(buzz_core::kind::KIND_AGENT_OBSERVER_FRAME, false),
+            LimitType::Messages,
+            "human observer events must retain the standard message quota"
+        );
+        assert_eq!(
+            event_admission_limit_type(9, true),
+            LimitType::Messages,
+            "ordinary agent messages must retain the standard message quota"
+        );
     }
 
     #[tokio::test]

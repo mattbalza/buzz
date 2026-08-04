@@ -24,6 +24,8 @@ export function useChannelSections(
 ): {
   sections: ChannelSection[];
   assignments: Record<string, string>;
+  isReady: boolean;
+  seedEmptyStore: (next: ChannelSectionStore) => boolean;
   createSection: (name: string, icon?: string) => ChannelSection | null;
   renameSection: (sectionId: string, newName: string, icon?: string) => void;
   deleteSection: (sectionId: string) => void;
@@ -39,6 +41,7 @@ export function useChannelSections(
     }
     return readChannelSectionsStore(pubkey, relayUrl);
   });
+  const [isReady, setIsReady] = React.useState(false);
 
   const managerRef = React.useRef<ChannelSectionSyncManager | null>(null);
   const lastAppliedRemoteTs = React.useRef(0);
@@ -47,11 +50,13 @@ export function useChannelSections(
   React.useEffect(() => {
     if (!pubkey) {
       setStore(DEFAULT_STORE);
+      setIsReady(false);
       lastAppliedRemoteTs.current = 0;
       lastAppliedEventId.current = "";
       return;
     }
     setStore(readChannelSectionsStore(pubkey, relayUrl));
+    setIsReady(false);
     lastAppliedRemoteTs.current = 0;
     lastAppliedEventId.current = "";
     managerRef.current = new ChannelSectionSyncManager(pubkey);
@@ -104,15 +109,17 @@ export function useChannelSections(
   React.useEffect(() => {
     if (!pubkey) return;
     let cancelled = false;
-    void managerRef.current?.fetchRemoteSections().then((remote) => {
+    void managerRef.current?.fetchRemoteSections().then((result) => {
       if (cancelled) return;
-      if (remote) {
-        setStore(applyRemote(remote));
-      } else {
+      if (result.status === "found") {
+        setStore(applyRemote(result.remote));
+        setIsReady(true);
+      } else if (result.status === "absent") {
         const local = readChannelSectionsStore(pubkey, relayUrl);
         if (local.sections.length > 0) {
           managerRef.current?.publishSections(local);
         }
+        setIsReady(true);
       }
     });
     return () => {
@@ -146,10 +153,13 @@ export function useChannelSections(
     if (!pubkey) return;
     let cancelled = false;
     const unsub = relayClient.subscribeToReconnects(() => {
-      void managerRef.current?.fetchRemoteSections().then((remote) => {
+      void managerRef.current?.fetchRemoteSections().then((result) => {
         if (cancelled) return;
-        if (remote) {
-          setStore(applyRemote(remote));
+        if (result.status === "found") {
+          setStore(applyRemote(result.remote));
+          setIsReady(true);
+        } else if (result.status === "absent") {
+          setIsReady(true);
         }
         const pending = managerRef.current?.getPendingStore();
         if (pending) {
@@ -192,6 +202,19 @@ export function useChannelSections(
         return next;
       });
       return section;
+    },
+    [pubkey, relayUrl],
+  );
+
+  const seedEmptyStore = React.useCallback(
+    (next: ChannelSectionStore): boolean => {
+      if (!pubkey) return false;
+      const current = readChannelSectionsStore(pubkey, relayUrl);
+      if (current.sections.length > 0) return false;
+      if (!writeChannelSectionsStore(pubkey, next, relayUrl)) return false;
+      setStore(next);
+      managerRef.current?.publishSections(next);
+      return true;
     },
     [pubkey, relayUrl],
   );
@@ -339,6 +362,8 @@ export function useChannelSections(
   return {
     sections,
     assignments: store.assignments,
+    isReady,
+    seedEmptyStore,
     createSection,
     renameSection,
     deleteSection,

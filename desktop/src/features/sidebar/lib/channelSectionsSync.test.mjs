@@ -13,6 +13,33 @@ function makeStore(overrides = {}) {
   };
 }
 
+test("fetchRemoteSections distinguishes confirmed absence from relay failure", async () => {
+  mock.method(relayClient, "fetchEvents", () => Promise.resolve([]));
+  try {
+    const manager = new ChannelSectionSyncManager("pk-absent");
+    assert.deepEqual(await manager.fetchRemoteSections(), { status: "absent" });
+    manager.destroy();
+  } finally {
+    mock.reset();
+  }
+
+  mock.method(relayClient, "fetchEvents", () =>
+    Promise.reject(new Error("relay unavailable")),
+  );
+  try {
+    const manager = new ChannelSectionSyncManager("pk-error");
+    assert.deepEqual(await manager.fetchRemoteSections(), { status: "error" });
+    assert.equal(
+      manager.getPendingStore(),
+      null,
+      "a failed read must not queue a replacement layout",
+    );
+    manager.destroy();
+  } finally {
+    mock.reset();
+  }
+});
+
 // ─── destroy() must cancel pending publish, not flush ─────────────────────────
 
 // Regression guard for the community-switch cross-relay publish vector:
