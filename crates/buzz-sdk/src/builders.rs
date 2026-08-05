@@ -1110,6 +1110,48 @@ pub fn build_git_issue(
     Ok(EventBuilder::new(Kind::Custom(KIND_GIT_ISSUE as u16), content).tags(tags))
 }
 
+/// Build a comment on a git issue or patch.
+///
+/// A kind:1 text note rather than a NIP-22 kind:1111 comment, because the relay
+/// does not register 1111 — this mirrors exactly what Buzz Desktop publishes
+/// (`desktop/src/features/projects/hooks.ts`). Both tags are load-bearing: the
+/// Projects UI *fetches* comments filtered by `#a`, then attributes each one to
+/// an issue by its root `e` tag, so a comment missing either is invisible.
+///
+/// `recipients` are `p`-tagged after the repo owner and deduplicated, so passing
+/// the issue author (the usual case) never double-tags an owner-authored issue.
+pub fn build_git_issue_comment(
+    repo: &GitRepoCoord,
+    issue_event_id: &str,
+    content: &str,
+    recipients: &[String],
+) -> Result<EventBuilder, SdkError> {
+    check_content(content, 64 * 1024)?;
+    if content.trim().is_empty() {
+        return Err(SdkError::InvalidInput("comment must not be empty".into()));
+    }
+    let a_value = repo.to_a_tag_value()?;
+    let issue = check_hex_exact(issue_event_id, 64, "issue event id")?;
+    let owner = check_pubkey_hex(&repo.owner, "repo owner")?;
+
+    let mut tags = vec![
+        tag(&["e", &issue, "", "root"])?,
+        tag(&["a", &a_value])?,
+        tag(&["p", &owner])?,
+    ];
+    let mut seen = vec![owner];
+    for recipient in recipients {
+        let pk = check_pubkey_hex(recipient, "recipient")?;
+        if seen.contains(&pk) {
+            continue;
+        }
+        tags.push(tag(&["p", &pk])?);
+        seen.push(pk);
+    }
+
+    Ok(EventBuilder::new(Kind::Custom(1), content).tags(tags))
+}
+
 /// Status to apply to a patch or issue root (kind:1630/1631/1632/1633, NIP-34).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitStatus {
@@ -3043,6 +3085,85 @@ mod tests {
             id: "repo".to_string(),
         };
         let err = build_git_issue(&repo, "", "body", &GitIssueMeta::default()).unwrap_err();
+        assert!(matches!(err, SdkError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn git_issue_comment_carries_both_a_and_root_e() {
+        let owner = "a".repeat(64);
+        let author = "b".repeat(64);
+        let issue = event_id().to_hex();
+        let repo = GitRepoCoord {
+            owner: owner.clone(),
+            id: "repo".to_string(),
+        };
+        let ev = sign(
+            build_git_issue_comment(
+                &repo,
+                &issue,
+                "shipped in #42",
+                std::slice::from_ref(&author),
+            )
+            .unwrap(),
+        );
+        assert_eq!(ev.kind.as_u16(), 1);
+        assert!(has_tag(&ev, "a", &format!("30617:{owner}:repo")));
+        assert!(has_tag(&ev, "e", &issue));
+        assert!(has_tag(&ev, "p", &owner));
+        assert!(has_tag(&ev, "p", &author));
+        // The root marker is what `commentsForIssue` attributes on.
+        let e_tag = ev
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some("e"))
+            .unwrap()
+            .as_slice()
+            .to_vec();
+        assert_eq!(e_tag, vec!["e", issue.as_str(), "", "root"]);
+    }
+
+    #[test]
+    fn git_issue_comment_does_not_double_tag_the_owner() {
+        let owner = "a".repeat(64);
+        let repo = GitRepoCoord {
+            owner: owner.clone(),
+            id: "repo".to_string(),
+        };
+        // An issue the ERP bot opened itself: author == owner.
+        let ev = sign(
+            build_git_issue_comment(
+                &repo,
+                &event_id().to_hex(),
+                "note",
+                std::slice::from_ref(&owner),
+            )
+            .unwrap(),
+        );
+        let p_tags = ev
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
+            .count();
+        assert_eq!(p_tags, 1);
+    }
+
+    #[test]
+    fn git_issue_comment_rejects_blank_body() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let err = build_git_issue_comment(&repo, &event_id().to_hex(), "   \n", &[]).unwrap_err();
+        assert!(matches!(err, SdkError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn git_issue_comment_rejects_bad_issue_id() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let err = build_git_issue_comment(&repo, "not-hex", "body", &[]).unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
     }
 

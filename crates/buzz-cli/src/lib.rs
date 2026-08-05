@@ -880,6 +880,12 @@ pub enum UsersCmd {
         #[arg(long = "owner", requires = "name")]
         owner: Option<String>,
     },
+    /// Print the current identity's own pubkey
+    ///
+    /// `users get` answers a different question: it returns published kind:0
+    /// profiles, so it is empty for an identity that has never set one. This
+    /// reads the signing key directly and never touches the relay.
+    Whoami,
     /// Update the current identity's profile
     #[command(name = "set-profile")]
     SetProfile {
@@ -1588,6 +1594,25 @@ pub enum IssuesCmd {
         /// Maximum number of results
         #[arg(long)]
         limit: Option<u32>,
+    },
+    /// Comment on an issue (kind:1 text note, as Buzz Desktop publishes it)
+    Comment {
+        /// Repo owner pubkey (64-char hex)
+        #[arg(long)]
+        repo_owner: String,
+        /// Repo identifier (d-tag)
+        #[arg(long)]
+        repo_id: String,
+        /// Issue event id (64-char hex)
+        #[arg(long)]
+        issue: String,
+        /// Comment body, markdown. Use '-' to read from stdin.
+        #[arg(long)]
+        content: String,
+        /// Additional recipient pubkey(s) besides the repo owner — e.g. the
+        /// issue author. Can be specified multiple times.
+        #[arg(long = "to")]
+        to: Vec<String>,
     },
     /// Set status on an issue (open/resolved/closed/draft — NIP-34 kind:1630-1633)
     Status {

@@ -77,6 +77,34 @@ pub async fn cmd_list_issues(
     Ok(())
 }
 
+/// Comment on an issue. The repo coordinate is required, not optional as it is
+/// on `issues status`: the Projects UI fetches comments by `#a` alone, so a
+/// comment without it is published successfully and then never shown.
+pub async fn cmd_comment_issue(
+    client: &BuzzClient,
+    repo_owner: &str,
+    repo_id: &str,
+    issue: &str,
+    content: &str,
+    to: &[String],
+) -> Result<(), CliError> {
+    validate_hex64(repo_owner)?;
+    validate_repo_id(repo_id)?;
+    validate_hex64(issue)?;
+    let body = read_or_stdin(content)?;
+
+    let repo = GitRepoCoord {
+        owner: repo_owner.to_string(),
+        id: repo_id.to_string(),
+    };
+
+    let builder = buzz_sdk::build_git_issue_comment(&repo, issue, &body, to).map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let resp = client.submit_event(event).await?;
+    println!("{resp}");
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_issue_status(
     client: &BuzzClient,
@@ -155,6 +183,13 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             label,
             to,
         } => cmd_create_issue(client, &repo_owner, &repo_id, &title, &content, &label, &to).await,
+        IssuesCmd::Comment {
+            repo_owner,
+            repo_id,
+            issue,
+            content,
+            to,
+        } => cmd_comment_issue(client, &repo_owner, &repo_id, &issue, &content, &to).await,
         IssuesCmd::Get { event } => cmd_get_issue(client, &event).await,
         IssuesCmd::List {
             repo_owner,
