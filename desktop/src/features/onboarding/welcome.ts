@@ -257,6 +257,51 @@ export async function ensureWelcomeChannel(
   return client.createChannel(welcomeChannelInput);
 }
 
+export type OptionalWelcomeChannelResult =
+  | { channel: Channel; unavailableReason?: undefined }
+  | { channel: null; unavailableReason: string };
+
+/**
+ * Resolve the personal Welcome channel without letting its absence fail first
+ * run. Relays configured with `channel_create_policy=owner-only` reject the
+ * create for every non-owner, so the private Welcome room is a nicety the
+ * community may simply not offer.
+ */
+export async function ensureOptionalWelcomeChannel(
+  client: WelcomeChannelClient,
+  options: WelcomeChannelOptions = {},
+): Promise<OptionalWelcomeChannelResult> {
+  try {
+    return { channel: await ensureWelcomeChannel(client, options) };
+  } catch (error) {
+    return {
+      channel: null,
+      unavailableReason:
+        error instanceof Error
+          ? error.message
+          : "The private Welcome channel is unavailable.",
+    };
+  }
+}
+
+/**
+ * Where first run should land: the personal Welcome channel when the community
+ * allows one, otherwise the shared welcome-everyone room, otherwise general.
+ */
+export function resolveWelcomeFocusChannelId(
+  welcomeChannel: Channel | null,
+  starterChannels: {
+    welcomeChannel: Channel | null;
+    generalChannel: Channel | null;
+  } | null,
+) {
+  return (
+    welcomeChannel?.id ??
+    starterChannels?.welcomeChannel?.id ??
+    starterChannels?.generalChannel?.id
+  );
+}
+
 export async function ensureStarterChannels(
   client: StarterChannelsClient,
 ): Promise<StarterChannelsResult> {
