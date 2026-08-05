@@ -880,6 +880,12 @@ pub enum UsersCmd {
         #[arg(long = "owner", requires = "name")]
         owner: Option<String>,
     },
+    /// Print the current identity's own pubkey
+    ///
+    /// `users get` answers a different question: it returns published kind:0
+    /// profiles, so it is empty for an identity that has never set one. This
+    /// reads the signing key directly and never touches the relay.
+    Whoami,
     /// Update the current identity's profile
     #[command(name = "set-profile")]
     SetProfile {

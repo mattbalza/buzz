@@ -1,5 +1,5 @@
 use buzz_core::kind::KIND_MANAGED_AGENT;
-use nostr::PublicKey;
+use nostr::{PublicKey, ToBech32};
 
 use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
 use crate::error::CliError;
@@ -81,6 +81,26 @@ pub async fn cmd_get_users(
         crate::OutputFormat::Json => serde_json::to_string(&profiles).unwrap_or_default(),
     };
     println!("{output}");
+    Ok(())
+}
+
+/// Print the signing identity's own pubkey, offline.
+///
+/// `users get` with no arguments looks like this but is not: it returns the
+/// kind:0 profiles published by that pubkey, so it yields an empty array for an
+/// identity that never set one — and every event this identity signs still
+/// carries the pubkey. Anything that has to build a coordinate for its own
+/// events (`30617:<owner>:<d>`) needs the key itself, not a profile.
+pub fn cmd_whoami(client: &BuzzClient) -> Result<(), CliError> {
+    let pubkey = client.keys().public_key();
+    let npub = pubkey
+        .to_bech32()
+        .map_err(|e| CliError::Other(format!("failed to encode npub: {e}")))?;
+    let out = serde_json::json!({
+        "pubkey": pubkey.to_hex(),
+        "npub": npub,
+    });
+    println!("{}", serde_json::to_string(&out).unwrap_or_default());
     Ok(())
 }
 
@@ -541,6 +561,7 @@ pub async fn dispatch(
             name,
             owner,
         } => cmd_get_users(client, &pubkeys, name.as_deref(), owner.as_deref(), format).await,
+        UsersCmd::Whoami => cmd_whoami(client),
         UsersCmd::SetProfile {
             name,
             avatar,
