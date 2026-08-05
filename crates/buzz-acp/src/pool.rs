@@ -695,18 +695,29 @@ fn browser_manager_request(
     Ok(value)
 }
 
+/// Register (or re-register) a browser activity with the trusted manager.
+///
+/// `channel_id` is the immutable trust boundary — the manager refuses to change
+/// it. `reply_anchor` is refreshed on every turn so anything the manager posts
+/// on the agent's behalf (takeover links, domain announcements) lands in the
+/// same thread the agent is replying in; `None` means top level.
 #[cfg(unix)]
 fn register_browser_activity(
     socket_path: &str,
     activity_id: &str,
     channel_id: Uuid,
+    reply_anchor: Option<&str>,
 ) -> Result<(), String> {
+    let mut context = serde_json::json!({"channel_id": channel_id.to_string()});
+    if let Some(anchor) = reply_anchor {
+        context["reply_to"] = serde_json::Value::String(anchor.to_string());
+    }
     browser_manager_request(
         socket_path,
         &serde_json::json!({
             "op": "register",
             "activity_id": activity_id,
-            "context": {"channel_id": channel_id.to_string()},
+            "context": context,
         }),
     )
     .map(|_| ())
@@ -741,8 +752,48 @@ fn register_browser_activity(
     _socket_path: &str,
     _activity_id: &str,
     _channel_id: Uuid,
+    _reply_anchor: Option<&str>,
 ) -> Result<(), String> {
     Err("ephemeral browsers require Unix sockets".into())
+}
+
+/// Re-register this channel's live browser activity with the anchor the agent's
+/// own reply will use.
+///
+/// A no-op unless the channel already has an ephemeral browser activity: the
+/// manager is the only consumer, and it refuses activities it did not register.
+/// Failures are logged, never fatal — a takeover link at channel top level is a
+/// worse reply, not a broken turn.
+fn refresh_browser_activity_anchor(
+    agent: &OwnedAgent,
+    ctx: &PromptContext,
+    batch: &FlushBatch,
+    channel_info: Option<&PromptChannelInfo>,
+    profile_lookup: &Option<PromptProfileLookup>,
+) {
+    let Some(activity_id) = agent.state.browser_activities.get(&batch.channel_id) else {
+        return;
+    };
+    let Some(socket) = agent.state.browser_manager_socket.as_deref().or_else(|| {
+        ctx.browser_mcp
+            .as_ref()
+            .and_then(|config| config.manager_socket.as_deref())
+    }) else {
+        return;
+    };
+    let is_dm = channel_info
+        .map(|info| info.channel_type == "dm")
+        .unwrap_or(false);
+    let anchor = crate::queue::batch_reply_anchor(batch, is_dm, profile_lookup.as_ref());
+    if let Err(error) =
+        register_browser_activity(socket, activity_id, batch.channel_id, anchor.as_deref())
+    {
+        tracing::warn!(
+            activity_id,
+            %error,
+            "browser manager rejected the per-turn reply anchor"
+        );
+    }
 }
 
 #[cfg(not(unix))]
@@ -1772,13 +1823,16 @@ pub async fn run_prompt_task(
                                         "ephemeral browser manager socket is missing".into(),
                                     )
                                 })?;
-                            register_browser_activity(manager_socket, &activity_id, *cid).map_err(
-                                |error| {
+                            // The reply anchor is not known yet (the batch is
+                            // formatted further down); the per-turn
+                            // re-registration below supplies it before the
+                            // agent can reach for the browser.
+                            register_browser_activity(manager_socket, &activity_id, *cid, None)
+                                .map_err(|error| {
                                     AcpError::Protocol(format!(
                                         "could not register browser activity: {error}"
                                     ))
-                                },
-                            )?;
+                                })?;
                             Ok(vec![browser_mcp_server(config, Some(&activity_id), *cid)])
                         } else {
                             Ok(vec![browser_mcp_server(config, None, *cid)])
@@ -2074,6 +2128,13 @@ pub async fn run_prompt_task(
 
         let profile_lookup =
             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
+
+        // Point this turn's browser activity at the same anchor the agent will
+        // reply to, so a takeover link posted mid-turn lands in the thread the
+        // human is waiting in rather than at the top of the channel. The ACP
+        // session (and its activity) outlives the turn, so this has to be
+        // refreshed here rather than at session creation.
+        refresh_browser_activity_anchor(&agent, &ctx, b, channel_info.as_ref(), &profile_lookup);
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -5489,6 +5550,48 @@ mod tests {
         std::fs::remove_file(socket_path).expect("remove test socket");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn browser_registration_carries_the_turn_reply_anchor() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let socket_path = std::path::PathBuf::from(format!("/tmp/bbm-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&socket_path).expect("bind test manager socket");
+        let channel = Uuid::new_v4();
+        let anchor = "b".repeat(64);
+        let expected_channel = channel.to_string();
+        let expected_anchor = anchor.clone();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept register");
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().expect("clone stream"))
+                    .read_line(&mut request)
+                    .expect("read register");
+                seen.push(serde_json::from_str::<serde_json::Value>(&request).expect("JSON"));
+                writeln!(stream, r#"{{"ok":true,"result":{{"state":"registered"}}}}"#)
+                    .expect("write response");
+            }
+            seen
+        });
+
+        let socket = socket_path.to_string_lossy().into_owned();
+        register_browser_activity(&socket, "activity-codex-0001", channel, None)
+            .expect("register without anchor");
+        register_browser_activity(&socket, "activity-codex-0001", channel, Some(&anchor))
+            .expect("register with anchor");
+
+        let seen = server.join().expect("manager test thread");
+        assert_eq!(seen[0]["op"], "register");
+        assert_eq!(seen[0]["context"]["channel_id"], expected_channel);
+        assert!(seen[0]["context"].get("reply_to").is_none());
+        assert_eq!(seen[1]["context"]["channel_id"], expected_channel);
+        assert_eq!(seen[1]["context"]["reply_to"], expected_anchor);
+        std::fs::remove_file(socket_path).expect("remove test socket");
+    }
+
     #[test]
     fn activity_browser_mcp_is_scoped_and_contains_no_secret() {
         let config = BrowserMcpConfig {
@@ -5558,6 +5661,7 @@ mod tests {
             socket_path.to_str().expect("socket path"),
             activity_id,
             channel_id,
+            None,
         )
         .expect("register activity");
         server.join().expect("manager test thread");

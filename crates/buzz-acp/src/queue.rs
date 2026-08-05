@@ -1223,6 +1223,34 @@ fn resolve_reply_anchor(
     )
 }
 
+/// Resolve this batch's `--reply-to` anchor: where anything the turn emits
+/// should land so it stays with the conversation that triggered it.
+///
+/// Shared by [`format_prompt`] (which tells the agent where to reply) and the
+/// browser-activity registration in `pool.rs` (which tells the browser manager
+/// where to post takeover links). One anchor, one definition — a takeover link
+/// that lands somewhere other than the agent's own reply is a bug.
+pub fn batch_reply_anchor(
+    batch: &FlushBatch,
+    is_dm: bool,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> Option<String> {
+    let last_event = batch.events.last()?;
+    let thread_tags = parse_thread_tags(&last_event.event);
+    if is_dm {
+        return thread_tags
+            .root_event_id
+            .is_some()
+            .then(|| last_event.event.id.to_hex());
+    }
+    resolve_reply_anchor(
+        &last_event.event.pubkey.to_hex(),
+        &thread_tags,
+        &last_event.event.id.to_hex(),
+        profile_lookup,
+    )
+}
+
 /// Format a `[Context]` hints section based on event scope.
 ///
 /// `reply_anchor` is the pre-resolved `--reply-to` target for this turn (see
@@ -1464,20 +1492,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //   - top-level     → anchor to the triggering event (it becomes the root)
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs are always 1:1 with a human, so they always anchor.
-    let sender_pubkey = last_event.event.pubkey.to_hex();
-    let reply_anchor = if is_dm {
-        thread_tags
-            .root_event_id
-            .is_some()
-            .then(|| last_event.event.id.to_hex())
-    } else {
-        resolve_reply_anchor(
-            &sender_pubkey,
-            &thread_tags,
-            &last_event.event.id.to_hex(),
-            args.profile_lookup,
-        )
-    };
+    let reply_anchor = batch_reply_anchor(batch, is_dm, args.profile_lookup);
     sections.push(format_context_hints(
         batch.channel_id,
         args.channel_info,
@@ -4043,6 +4058,60 @@ mod tests {
             !prompt.contains(&format!("--reply-to {parent_id}")),
             "instruction should NOT anchor to the parent event id"
         );
+    }
+
+    #[test]
+    fn test_batch_reply_anchor_matches_the_prompt_instruction() {
+        // The browser manager posts takeover links at this anchor, so it has to
+        // be the same event the agent is told to reply to — a link in the
+        // channel while the answer is in the thread is the bug this prevents.
+        let root_id = "a".repeat(64);
+        let event = make_event_with_tags(
+            "@bot open a browser",
+            vec![vec!["e".into(), root_id.clone(), "".into(), "root".into()]],
+        );
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        assert_eq!(
+            batch_reply_anchor(&batch, false, None).as_deref(),
+            Some(root_id.as_str())
+        );
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+        assert!(prompt.contains(&format!("--reply-to {root_id}")));
+    }
+
+    #[test]
+    fn test_batch_reply_anchor_is_none_for_agent_to_agent_turns() {
+        let event = make_event_with_tags(
+            "@other-agent take this",
+            vec![vec!["p".into(), AGENT_B_PK.into()]],
+        );
+        let sender = event.pubkey.to_hex();
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let lookup = PromptProfileLookup::from([
+            (sender, profile(true)),
+            (AGENT_B_PK.to_string(), profile(true)),
+        ]);
+
+        assert_eq!(batch_reply_anchor(&batch, false, Some(&lookup)), None);
     }
 
     #[test]
