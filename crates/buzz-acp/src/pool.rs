@@ -5457,8 +5457,7 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
-        let socket_path =
-            std::path::PathBuf::from(format!("/tmp/bbm-{}.sock", Uuid::new_v4()));
+        let socket_path = std::path::PathBuf::from(format!("/tmp/bbm-{}.sock", Uuid::new_v4()));
         let listener = UnixListener::bind(&socket_path).expect("bind test manager socket");
         let channel = Uuid::new_v4();
         let activity_id = "activity-codex-0001".to_string();
@@ -5469,8 +5468,7 @@ mod tests {
             BufReader::new(stream.try_clone().expect("clone stream"))
                 .read_line(&mut request)
                 .expect("read callback");
-            let request: serde_json::Value =
-                serde_json::from_str(&request).expect("turn-end JSON");
+            let request: serde_json::Value = serde_json::from_str(&request).expect("turn-end JSON");
             assert_eq!(request["op"], "turn_ended");
             assert_eq!(request["activity_id"], expected_activity);
             writeln!(stream, r#"{{"ok":true,"result":{{"state":"stopped"}}}}"#)
@@ -5480,7 +5478,9 @@ mod tests {
             browser_manager_socket: Some(socket_path.to_string_lossy().into_owned()),
             ..SessionState::default()
         };
-        state.browser_activities.insert(channel, activity_id.clone());
+        state
+            .browser_activities
+            .insert(channel, activity_id.clone());
 
         state.finish_browser_turn(&PromptSource::Channel(channel));
 
