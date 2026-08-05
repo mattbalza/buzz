@@ -160,6 +160,21 @@ impl SessionState {
             .clone()
     }
 
+    /// Release this turn's browser generation while keeping the trusted ACP
+    /// activity registration available for a fresh generation on later use.
+    fn finish_browser_turn(&self, source: &PromptSource) {
+        let PromptSource::Channel(channel_id) = source else {
+            return;
+        };
+        let Some(activity_id) = self.browser_activities.get(channel_id) else {
+            return;
+        };
+        let Some(socket) = self.browser_manager_socket.as_deref() else {
+            return;
+        };
+        notify_browser_turn_ended(socket, activity_id);
+    }
+
     #[cfg(test)]
     fn has_channel_state(&self, channel_id: &Uuid) -> bool {
         self.sessions.contains_key(channel_id)
@@ -709,6 +724,18 @@ fn notify_browser_activity_ended(socket_path: &str, activity_id: &str) {
     }
 }
 
+#[cfg(unix)]
+fn notify_browser_turn_ended(socket_path: &str, activity_id: &str) {
+    let request = serde_json::json!({"op":"turn_ended", "activity_id":activity_id});
+    if let Err(error) = browser_manager_request(socket_path, &request) {
+        tracing::warn!(
+            activity_id,
+            %error,
+            "browser manager rejected turn end callback"
+        );
+    }
+}
+
 #[cfg(not(unix))]
 fn register_browser_activity(
     _socket_path: &str,
@@ -720,6 +747,9 @@ fn register_browser_activity(
 
 #[cfg(not(unix))]
 fn notify_browser_activity_ended(_socket_path: &str, _activity_id: &str) {}
+
+#[cfg(not(unix))]
+fn notify_browser_turn_ended(_socket_path: &str, _activity_id: &str) {}
 
 impl AgentPool {
     /// Create a pool from pre-indexed slots (may contain None for failed startups).
@@ -1490,6 +1520,7 @@ fn send_prompt_result(
     outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
+    agent.state.finish_browser_turn(&source);
     agent.acp.clear_steer_rx();
     let _ = result_tx.send(PromptResult {
         agent,
@@ -5418,6 +5449,44 @@ mod tests {
         state.invalidate_channel(&channel);
         let rotated = state.ensure_browser_activity(channel);
         assert_ne!(first, rotated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_turn_end_releases_generation_without_rotating_acp_activity() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let socket_path =
+            std::path::PathBuf::from(format!("/tmp/bbm-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&socket_path).expect("bind test manager socket");
+        let channel = Uuid::new_v4();
+        let activity_id = "activity-codex-0001".to_string();
+        let expected_activity = activity_id.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept turn-end callback");
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().expect("clone stream"))
+                .read_line(&mut request)
+                .expect("read callback");
+            let request: serde_json::Value =
+                serde_json::from_str(&request).expect("turn-end JSON");
+            assert_eq!(request["op"], "turn_ended");
+            assert_eq!(request["activity_id"], expected_activity);
+            writeln!(stream, r#"{{"ok":true,"result":{{"state":"stopped"}}}}"#)
+                .expect("write response");
+        });
+        let mut state = SessionState {
+            browser_manager_socket: Some(socket_path.to_string_lossy().into_owned()),
+            ..SessionState::default()
+        };
+        state.browser_activities.insert(channel, activity_id.clone());
+
+        state.finish_browser_turn(&PromptSource::Channel(channel));
+
+        assert_eq!(state.browser_activities.get(&channel), Some(&activity_id));
+        server.join().expect("manager test thread");
+        std::fs::remove_file(socket_path).expect("remove test socket");
     }
 
     #[test]
