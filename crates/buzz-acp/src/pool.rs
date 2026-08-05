@@ -123,18 +123,33 @@ impl SessionState {
         }
     }
 
-    /// Invalidate a single channel's session and turn counter.
-    /// Returns `true` if the channel had an active session.
+    /// Invalidate a single channel's session and turn counter, keeping its
+    /// browser activity. Returns `true` if the channel had an active session.
+    ///
+    /// A session rotation — token cap, turn cap, model switch, cancel — is the
+    /// same conversation with the same people in it, so the browser it was
+    /// using is still theirs. Ending the activity here handed the next turn a
+    /// fresh generation: new profile, empty allowlist, new takeover link, and
+    /// the half-finished login a human was in the middle of thrown away. Only
+    /// [`Self::end_channel`] and [`Self::invalidate_all`] — where the channel
+    /// or the agent process itself is gone — end the activity.
     pub fn invalidate_channel(&mut self, channel_id: &Uuid) -> bool {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
+        self.sessions.remove(channel_id).is_some()
+    }
+
+    /// Invalidate a channel and end its browser activity, because the agent is
+    /// leaving the channel: nobody is coming back for that browser.
+    pub fn end_channel(&mut self, channel_id: &Uuid) -> bool {
+        let had_session = self.invalidate_channel(channel_id);
         if let Some(activity_id) = self.browser_activities.remove(channel_id) {
             if let Some(socket) = self.browser_manager_socket.as_deref() {
                 notify_browser_activity_ended(socket, &activity_id);
             }
         }
-        self.sessions.remove(channel_id).is_some()
+        had_session
     }
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
@@ -979,7 +994,7 @@ impl AgentPool {
         let mut count = 0;
         for slot in &mut self.agents {
             if let Some(agent) = slot.as_mut() {
-                if agent.state.invalidate_channel(&channel_id) {
+                if agent.state.end_channel(&channel_id) {
                     count += 1;
                 }
             }
@@ -5499,7 +5514,11 @@ mod tests {
     }
 
     #[test]
-    fn browser_activity_is_stable_until_channel_session_is_invalidated() {
+    fn browser_activity_outlives_a_session_rotation_and_ends_with_the_channel() {
+        // Rotating the ACP session used to hand the next turn a new activity —
+        // new profile, empty allowlist, new takeover link — which is why a
+        // human's half-finished login could never survive the turn that asked
+        // for it. Only leaving the channel ends the activity.
         let channel = Uuid::new_v4();
         let mut state = SessionState::default();
         let first = state.ensure_browser_activity(channel);
@@ -5508,8 +5527,26 @@ mod tests {
         assert_eq!(first.len(), 32);
 
         state.invalidate_channel(&channel);
-        let rotated = state.ensure_browser_activity(channel);
-        assert_ne!(first, rotated);
+        assert_eq!(state.ensure_browser_activity(channel), first);
+        state.invalidate(&PromptSource::Channel(channel));
+        assert_eq!(state.ensure_browser_activity(channel), first);
+
+        state.end_channel(&channel);
+        assert_ne!(state.ensure_browser_activity(channel), first);
+    }
+
+    #[test]
+    fn losing_the_agent_ends_every_browser_activity() {
+        // The counterweight: an exited agent or a hard timeout takes every ACP
+        // session with it, and a browser bound to a session nobody can resume
+        // is stranded until the manager's TTL reaps it.
+        let mut state = SessionState::default();
+        let first = state.ensure_browser_activity(Uuid::new_v4());
+
+        state.invalidate_all();
+
+        assert!(state.browser_activities.is_empty());
+        assert_ne!(state.ensure_browser_activity(Uuid::new_v4()), first);
     }
 
     #[cfg(unix)]
