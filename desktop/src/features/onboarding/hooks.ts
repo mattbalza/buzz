@@ -8,12 +8,13 @@ import {
 } from "@/features/agents/hooks";
 import { channelsQueryKey } from "@/features/channels/hooks";
 import {
+  ensureOptionalWelcomeChannel,
   ensureStarterChannels,
-  ensureWelcomeChannel,
   hasEnsuredWelcomeChannel,
   markWelcomeChannelEnsured,
   notifyWelcomeChannelReady,
   rememberPendingWelcomeChannel,
+  resolveWelcomeFocusChannelId,
 } from "@/features/onboarding/welcome";
 import { forceFreshOnboarding } from "@/features/onboarding/devFreshOnboarding";
 import { ensureWelcomeCanvas } from "@/features/onboarding/welcomeCanvas";
@@ -93,41 +94,55 @@ export async function initializeStarterChannels(
       console.warn("Failed to initialize public starter channels.", error);
     }
 
-    const welcomeChannel = await ensureWelcomeChannel(
-      {
-        createChannel,
-        deleteChannel,
-        getChannelMembers,
-        getChannels,
-        updateChannel,
-      },
-      {
-        replaceExisting: forceFreshOnboarding,
-      },
-    );
+    const { channel: welcomeChannel, unavailableReason } =
+      await ensureOptionalWelcomeChannel(
+        {
+          createChannel,
+          deleteChannel,
+          getChannelMembers,
+          getChannels,
+          updateChannel,
+        },
+        {
+          replaceExisting: forceFreshOnboarding,
+        },
+      );
+
+    if (!welcomeChannel) {
+      // Owner-only relays reject member-created channels, so this community
+      // just has no private Welcome room. Record it as settled, otherwise the
+      // retry effect re-attempts the rejected create on every mount.
+      console.warn(
+        "Continuing without a private Welcome channel.",
+        unavailableReason,
+      );
+      markWelcomeChannelEnsured(pubkey, communityScope);
+    }
 
     const starterChannelList = starterChannels?.channels ?? [];
+    const ensuredChannelList = welcomeChannel
+      ? [...starterChannelList, welcomeChannel]
+      : starterChannelList;
     queryClient.setQueryData<Channel[]>(channelsQueryKey, (channels = []) => {
       const ensuredIds = new Set(
-        starterChannelList.map((channel) => channel.id),
+        ensuredChannelList.map((channel) => channel.id),
       );
-      ensuredIds.add(welcomeChannel.id);
+      const ensuredById = new Map(
+        ensuredChannelList.map((channel) => [channel.id, channel]),
+      );
       return [
-        ...starterChannelList,
-        ...(starterChannelList.some(
-          (channel) => channel.id === welcomeChannel.id,
-        )
-          ? []
-          : [welcomeChannel]),
+        ...ensuredById.values(),
         ...channels.filter((channel) => !ensuredIds.has(channel.id)),
       ];
     });
-    void seedWelcomeExperience(
-      queryClient,
-      welcomeChannel.id,
-      pubkey,
-      communityScope,
-    );
+    if (welcomeChannel) {
+      void seedWelcomeExperience(
+        queryClient,
+        welcomeChannel.id,
+        pubkey,
+        communityScope,
+      );
+    }
     await queryClient.invalidateQueries({ queryKey: channelsQueryKey });
     if (focus) {
       // Refreshing can briefly replace the optimistic cache with an older relay
@@ -135,16 +150,21 @@ export async function initializeStarterChannels(
       // the route can consume the pending private Welcome channel immediately.
       queryClient.setQueryData<Channel[]>(channelsQueryKey, (channels = []) => {
         const byId = new Map(
-          [...channels, ...starterChannelList, welcomeChannel].map(
-            (channel) => [channel.id, channel],
-          ),
+          [...channels, ...ensuredChannelList].map((channel) => [
+            channel.id,
+            channel,
+          ]),
         );
         return [...byId.values()];
       });
-      rememberPendingWelcomeChannel(welcomeChannel.id);
-      notifyWelcomeChannelReady(welcomeChannel.id);
+      if (welcomeChannel) {
+        rememberPendingWelcomeChannel(welcomeChannel.id);
+        notifyWelcomeChannelReady(welcomeChannel.id);
+      }
     }
-    const focusChannelId = focus ? welcomeChannel.id : undefined;
+    const focusChannelId = focus
+      ? resolveWelcomeFocusChannelId(welcomeChannel, starterChannels)
+      : undefined;
     if (starterChannelsError) {
       return {
         ok: false,

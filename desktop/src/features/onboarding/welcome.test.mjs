@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   consumePendingWelcomeChannel,
+  ensureOptionalWelcomeChannel,
   ensureStarterChannels,
   ensureWelcomeChannel,
   findPrivateWelcomeChannel,
@@ -10,6 +11,7 @@ import {
   isWelcomeExperienceChannel,
   markWelcomeChannelEnsured,
   rememberPendingWelcomeChannel,
+  resolveWelcomeFocusChannelId,
   WELCOME_CHANNEL_DESCRIPTION,
   WELCOME_CHANNEL_NAME,
 } from "./welcome.ts";
@@ -359,4 +361,90 @@ test("isWelcomeExperienceChannel matches legacy Welcome and starter welcome-ever
     false,
   );
   assert.equal(isWelcomeExperienceChannel(null), false);
+});
+
+const OWNER_ONLY_RELAY_ERROR =
+  "restricted: only workspace owners may create durable channels or forums";
+
+test("ensureOptionalWelcomeChannel returns the channel when the relay allows it", async () => {
+  const created = makeChannel({ id: "welcome-created" });
+  const result = await ensureOptionalWelcomeChannel({
+    getChannels: async () => [],
+    createChannel: async () => created,
+  });
+
+  assert.equal(result.channel, created);
+  assert.equal(result.unavailableReason, undefined);
+});
+
+test("ensureOptionalWelcomeChannel reports unavailable on an owner-only relay", async () => {
+  // Regression: relays running channel_create_policy=owner-only reject the
+  // personal Welcome channel for every member, which used to fail first run
+  // outright with "Couldn't set up starter channels".
+  const result = await ensureOptionalWelcomeChannel({
+    getChannels: async () => [],
+    createChannel: async () => {
+      throw new Error(OWNER_ONLY_RELAY_ERROR);
+    },
+  });
+
+  assert.equal(result.channel, null);
+  assert.equal(result.unavailableReason, OWNER_ONLY_RELAY_ERROR);
+});
+
+test("ensureOptionalWelcomeChannel reports unavailable for a non-Error rejection", async () => {
+  const result = await ensureOptionalWelcomeChannel({
+    getChannels: async () => {
+      throw "relay offline";
+    },
+    createChannel: async () => makeChannel(),
+  });
+
+  assert.equal(result.channel, null);
+  assert.equal(typeof result.unavailableReason, "string");
+  assert.ok(result.unavailableReason.length > 0);
+});
+
+test("resolveWelcomeFocusChannelId prefers the private Welcome channel", () => {
+  const personal = makeChannel({ id: "welcome-private" });
+  const general = makeChannel({ id: "general-1", name: "general" });
+  const welcomeEveryone = makeChannel({
+    id: "welcome-everyone-1",
+    name: "welcome-everyone",
+  });
+
+  assert.equal(
+    resolveWelcomeFocusChannelId(personal, {
+      channels: [general, welcomeEveryone],
+      generalChannel: general,
+      welcomeChannel: welcomeEveryone,
+    }),
+    "welcome-private",
+  );
+});
+
+test("resolveWelcomeFocusChannelId falls back to welcome-everyone, then general", () => {
+  const general = makeChannel({ id: "general-1", name: "general" });
+  const welcomeEveryone = makeChannel({
+    id: "welcome-everyone-1",
+    name: "welcome-everyone",
+  });
+
+  assert.equal(
+    resolveWelcomeFocusChannelId(null, {
+      channels: [general, welcomeEveryone],
+      generalChannel: general,
+      welcomeChannel: welcomeEveryone,
+    }),
+    "welcome-everyone-1",
+  );
+  assert.equal(
+    resolveWelcomeFocusChannelId(null, {
+      channels: [general],
+      generalChannel: general,
+      welcomeChannel: null,
+    }),
+    "general-1",
+  );
+  assert.equal(resolveWelcomeFocusChannelId(null, null), undefined);
 });
