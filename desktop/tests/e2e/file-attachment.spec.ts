@@ -48,13 +48,20 @@ async function chooseQuarterlyReport(page: Page) {
   });
 }
 
+/**
+ * Big enough to exercise the progress UI, small enough to clear the 10 MiB
+ * client cap in `mediaSizeLimit.ts` — upstream's 16 MiB buffer is refused by
+ * the composer before it can queue, so every "large video" test would fail.
+ */
+const LARGE_VIDEO_BYTES = 8 * 1024 * 1024;
+
 async function chooseLargeVideo(page: Page) {
   const [chooser] = await Promise.all([
     page.waitForEvent("filechooser"),
     page.getByRole("button", { name: "Attach file" }).click(),
   ]);
   await chooser.setFiles({
-    buffer: Buffer.alloc(16 * 1024 * 1024, 1),
+    buffer: Buffer.alloc(LARGE_VIDEO_BYTES, 1),
     mimeType: "video/mp4",
     name: "large-video.mp4",
   });
@@ -272,7 +279,7 @@ test("shows upload feedback before transferring a large file", async ({
     )
     .toContainEqual({
       command: "upload_media_bytes_raw",
-      payload: { rawByteLength: 16 * 1024 * 1024 },
+      payload: { rawByteLength: LARGE_VIDEO_BYTES },
     });
 
   const uploadId = "background-media-upload-0-0";
