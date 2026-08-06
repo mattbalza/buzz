@@ -6,6 +6,12 @@ import {
   uploadMediaBytes,
 } from "@/shared/api/tauri";
 
+import {
+  MEDIA_TOO_LARGE_MESSAGE,
+  formatUploadError,
+  partitionBySize,
+} from "./mediaSizeLimit";
+
 /**
  * First 4 hex chars of the sha256 — used as a short display name.
  * Note: 4 hex chars = 65,536 possible values. Collision is unlikely
@@ -361,10 +367,19 @@ export function useMediaUpload() {
     (err: unknown, previewId?: number) => {
       if (isUploadCanceled(previewId)) return;
       finishUpload(previewId);
-      setUploadState({ status: "error", message: String(err) });
+      setUploadState({ status: "error", message: formatUploadError(err) });
     },
     [finishUpload, isUploadCanceled],
   );
+
+  /**
+   * Report files rejected by the pre-flight check. Nothing was uploaded for
+   * these, so there is no preview to finish — only the banner to raise.
+   */
+  const reportOversize = React.useCallback((count: number) => {
+    if (count === 0) return;
+    setUploadState({ status: "error", message: MEDIA_TOO_LARGE_MESSAGE });
+  }, []);
 
   const handlePaperclip = React.useCallback(async () => {
     // Hold a single pending tick while the native picker is open + uploads
@@ -395,9 +410,13 @@ export function useMediaUpload() {
       const files = Array.from(event.dataTransfer.files);
       if (files.length === 0) return;
 
-      // Accept any file. The Tauri layer and the relay enforce the deny-list
-      // (active-content + executables) and size caps; everything else uploads.
-      const validFiles = files;
+      // Accept any file type. The Tauri layer and the relay enforce the
+      // deny-list (active-content + executables); everything else uploads.
+      // Size is the one thing checked here rather than at the relay, so a
+      // 400 MB video is refused now instead of after the transfer.
+      const { accepted: validFiles, oversize } = partitionBySize(files);
+      reportOversize(oversize.length);
+      if (validFiles.length === 0) return;
 
       setUploadingCount((c) => c + validFiles.length);
       const baseIndex = reserveSlots(validFiles.length);
@@ -428,6 +447,7 @@ export function useMediaUpload() {
       fillSlot,
       isUploadCanceled,
       onUploadError,
+      reportOversize,
       reserveUploadingPreview,
     ],
   );
@@ -489,13 +509,17 @@ export function useMediaUpload() {
       const items = Array.from(event.clipboardData.items);
       // Only clipboard items that are actual files — `getAsFile()` returns null
       // for text/string items, so pasting plain text never triggers an upload.
-      const mediaFiles = items
+      const pastedFiles = items
         .filter((item) => item.kind === "file")
         .map((item) => item.getAsFile())
         .filter((f): f is File => f !== null);
-      if (mediaFiles.length === 0) return;
+      if (pastedFiles.length === 0) return;
 
       event.preventDefault();
+
+      const { accepted: mediaFiles, oversize } = partitionBySize(pastedFiles);
+      reportOversize(oversize.length);
+      if (mediaFiles.length === 0) return;
 
       setUploadingCount((c) => c + mediaFiles.length);
       const baseIndex = reserveSlots(mediaFiles.length);
@@ -525,6 +549,7 @@ export function useMediaUpload() {
       fillSlot,
       isUploadCanceled,
       onUploadError,
+      reportOversize,
       reserveUploadingPreview,
     ],
   );
@@ -532,6 +557,11 @@ export function useMediaUpload() {
   /** Upload a File directly — used by Tiptap's editorProps.handlePaste. */
   const uploadFile = React.useCallback(
     async (file: File) => {
+      const { oversize } = partitionBySize([file]);
+      if (oversize.length > 0) {
+        reportOversize(oversize.length);
+        return;
+      }
       const previewId = reserveUploadingPreview(file);
       setUploadingCount((c) => c + 1);
       try {
@@ -547,7 +577,13 @@ export function useMediaUpload() {
         onUploadError(err, previewId);
       }
     },
-    [isUploadCanceled, onUploaded, onUploadError, reserveUploadingPreview],
+    [
+      isUploadCanceled,
+      onUploaded,
+      onUploadError,
+      reportOversize,
+      reserveUploadingPreview,
+    ],
   );
 
   /**
