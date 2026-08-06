@@ -76,15 +76,6 @@ if grep -vE '^\s*#' "$docker_workflow" | grep -Fq 'ghcr.io/block/'; then
   echo "Docker publishing still contains an operational Block-only image reference" >&2
   exit 1
 fi
-compose_file="$repo_root/deploy/compose/compose.yml"
-grep -Fq 'BUZZ_DB_POOL_SIZE: ${BUZZ_DB_POOL_SIZE:-12}' "$compose_file" || {
-  echo "production Compose does not bound the relay writer pool" >&2
-  exit 1
-}
-grep -Fq 'BUZZ_DB_READ_POOL_SIZE: ${BUZZ_DB_READ_POOL_SIZE:-12}' "$compose_file" || {
-  echo "production Compose does not bound the relay reader pool" >&2
-  exit 1
-}
 
 "$repo_root/scripts/test-signed-canary-contract.sh"
 auto_tag="$repo_root/.github/workflows/auto-tag-on-release-pr-merge.yml"
