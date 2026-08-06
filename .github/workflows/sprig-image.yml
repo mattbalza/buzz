@@ -47,8 +47,9 @@ permissions: {}
 
 env:
   # Single source of truth for the image name; override with the
-  # GHCR_SPRIG_IMAGE repo variable (same pattern as docker.yml).
-  IMAGE_NAME: ${{ vars.GHCR_SPRIG_IMAGE != '' && vars.GHCR_SPRIG_IMAGE || 'ghcr.io/block/buzz-sprig' }}
+  # GHCR_SPRIG_IMAGE repo variable (same pattern as docker.yml). Forks publish
+  # to their own GHCR namespace — nobody but block can push to block's.
+  IMAGE_NAME: ${{ vars.GHCR_SPRIG_IMAGE != '' && vars.GHCR_SPRIG_IMAGE || format('ghcr.io/{0}/buzz-sprig', github.repository_owner) }}
 
 jobs:
   build:
@@ -87,7 +88,10 @@ jobs:
               max-parallelism = 2
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        # Pull requests are build-only and never receive registry credentials:
+        # in a fork, GITHUB_TOKEN is read-only even for a same-repo PR, so
+        # logging in there fails the job with `ghcr.io/v2/: denied`.
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
         with:
           registry: ghcr.io
@@ -124,7 +128,7 @@ jobs:
           cache-from: |
             type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
           cache-to: |
-            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
+            ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
 
       - name: Export digest
         if: github.event_name != 'pull_request'

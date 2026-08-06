@@ -77,6 +77,21 @@ if grep -vE '^\s*#' "$docker_workflow" | grep -Fq 'ghcr.io/block/'; then
   exit 1
 fi
 
+# Same contract for the sprig agent image, which ships from its own workflow.
+sprig_workflow="$repo_root/.github/workflows/sprig-image.yml"
+if grep -Fq "$unsafe_pr_cache_condition" "$sprig_workflow"; then
+  echo "pull-request sprig builds can receive registry credentials or write caches" >&2
+  exit 1
+fi
+grep -Fq "format('ghcr.io/{0}/buzz-sprig', github.repository_owner)" "$sprig_workflow" || {
+  echo "sprig image does not default to the authenticated repository owner" >&2
+  exit 1
+}
+if grep -vE '^\s*#' "$sprig_workflow" | grep -Fq 'ghcr.io/block/'; then
+  echo "sprig publishing still contains an operational Block-only image reference" >&2
+  exit 1
+fi
+
 "$repo_root/scripts/test-signed-canary-contract.sh"
 "$repo_root/scripts/test-desktop-release-cache-key.sh"
 "$repo_root/scripts/test-desktop-release-cache-workflow.sh"
