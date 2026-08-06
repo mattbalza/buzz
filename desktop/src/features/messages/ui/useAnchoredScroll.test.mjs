@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  classifyProgrammaticBottomSettle,
   getPinnedCenterDrift,
   settleProgrammaticBottomPin,
   shouldIgnorePinnedCenterScroll,
@@ -124,6 +125,63 @@ test("settleProgrammaticBottomPin keeps settling when the floor is still out of 
   assert.equal(
     container.scrollHeight - container.clientHeight - container.scrollTop,
     2,
+  );
+});
+
+test("settle classification holds while only the content grows", () => {
+  // Rows measured taller: scrollHeight grew, scrollTop held at the armed floor.
+  assert.equal(
+    classifyProgrammaticBottomSettle({
+      armedScrollTop: 100,
+      container: { clientHeight: 100, scrollHeight: 260, scrollTop: 100 },
+    }),
+    "settle",
+  );
+  // Sub-pixel jitter is not the reader.
+  assert.equal(
+    classifyProgrammaticBottomSettle({
+      armedScrollTop: 100,
+      container: { clientHeight: 100, scrollHeight: 260, scrollTop: 98.5 },
+    }),
+    "settle",
+  );
+  // Never armed (virtualizer path): nothing to compare against.
+  assert.equal(
+    classifyProgrammaticBottomSettle({
+      armedScrollTop: null,
+      container: { clientHeight: 100, scrollHeight: 260, scrollTop: 20 },
+    }),
+    "settle",
+  );
+});
+
+test("settle classification releases to the reader who scrolls off the floor", () => {
+  assert.equal(
+    classifyProgrammaticBottomSettle({
+      armedScrollTop: 100,
+      container: { clientHeight: 100, scrollHeight: 200, scrollTop: 40 },
+    }),
+    "user-scroll",
+  );
+  // Scrolling down but short of the floor is equally the reader's move.
+  assert.equal(
+    classifyProgrammaticBottomSettle({
+      armedScrollTop: 40,
+      container: { clientHeight: 100, scrollHeight: 200, scrollTop: 70 },
+    }),
+    "user-scroll",
+  );
+});
+
+test("settle classification treats a shrink-clamped scrollTop as settling", () => {
+  // Content shrank under a bottom pin: the browser clamped scrollTop down on
+  // its own, and the view is still on the floor.
+  assert.equal(
+    classifyProgrammaticBottomSettle({
+      armedScrollTop: 100,
+      container: { clientHeight: 100, scrollHeight: 160, scrollTop: 60 },
+    }),
+    "settle",
   );
 });
 

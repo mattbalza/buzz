@@ -8,6 +8,9 @@ export default defineConfig({
   reporter: [
     ["list"],
     ["html", { open: "never", outputFolder: "playwright-report" }],
+    // scripts/summarize-flaky-tests.mjs (CI) reads this; without it every shard
+    // skipped the flake summary on ENOENT.
+    ["json", { outputFile: "playwright-report.json" }],
   ],
   use: {
     baseURL: "http://127.0.0.1:4173",

@@ -181,11 +181,42 @@ test("focus and split preserve reading context and interaction ownership", async
     .toBe(true);
   await expect(channel).toHaveAttribute("inert", "");
 
-  await body.evaluate((element) => {
-    element.scrollTop = element.scrollHeight * 0.4;
-    element.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
-  const anchorId = await topVisibleMessageId(body);
+  // Scroll the way a reader does — a synthetic `scrollTop` write plus a faked
+  // `scroll` event races the app's own post-open scroll work, so a green run
+  // could just mean the app had already moved the position we sampled.
+  await body.hover();
+  await page.mouse.wheel(
+    0,
+    -(await body.evaluate(
+      (element) => (element.scrollHeight - element.clientHeight) * 0.6,
+    )),
+  );
+
+  // Only sample the anchor once the position holds across two polls: anything
+  // the app still has queued must land before the reading row is recorded.
+  let topVisibleId: string | null = null;
+  await expect
+    .poll(
+      async () => {
+        const current = await topVisibleMessageId(body);
+        const held = current === topVisibleId;
+        topVisibleId = current;
+        return held;
+      },
+      { intervals: [200, 200, 200, 200, 200] },
+    )
+    .toBe(true);
+  const anchorId = topVisibleId as string;
+
+  // The scroll itself has to survive the thread's own post-open scroll work.
+  // If the view snaps back to the newest reply, every assertion below is
+  // vacuously true — it would be preserving the bottom, not a reading position.
+  expect(
+    await body.evaluate(
+      (element) =>
+        element.scrollHeight - element.clientHeight - element.scrollTop,
+    ),
+  ).toBeGreaterThan(100);
 
   const focusModeToggle = page.getByRole("button", {
     name: "Show thread beside channel",
