@@ -1140,6 +1140,25 @@ async fn resolve_new_session_channel_context(
     (is_dm, title_channel, Some(info.channel_type))
 }
 
+/// What a brand-new ACP session is seeded with, beyond the agent and its
+/// `PromptContext`: the memory blocks to frame into the system prompt and the
+/// channel the session belongs to.
+///
+/// Grouped rather than passed loose so the heartbeat path can say "no channel,
+/// no memory" as `SessionSeed::default()` instead of five bare `None`s.
+#[derive(Default)]
+struct SessionSeed<'a> {
+    /// `[Agent Memory — core]` block, when the agent has one.
+    agent_core: Option<&'a str>,
+    /// `[Channel Canvas]` block for the originating channel.
+    agent_canvas: Option<&'a str>,
+    /// Channel name for the session title — `None` for DMs, unresolved and
+    /// unnamed channels, which then get an unqualified title.
+    channel_name: Option<&'a str>,
+    channel_id: Option<Uuid>,
+    channel_type: Option<&'a str>,
+}
+
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
 /// on the agent (first session only), and apply `desired_model` if set.
 ///
@@ -1149,11 +1168,7 @@ async fn resolve_new_session_channel_context(
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
-    agent_core: Option<&str>,
-    agent_canvas: Option<&str>,
-    channel_name: Option<&str>,
-    channel_id: Option<Uuid>,
-    channel_type: Option<&str>,
+    seed: SessionSeed<'_>,
     session_mcp_servers: Vec<McpServer>,
 ) -> Result<String, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
@@ -1169,21 +1184,21 @@ async fn create_session_and_apply_model(
                 framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
                 ctx.team_instructions.as_deref(),
             ),
-            agent_core,
+            seed.agent_core,
         ),
-        agent_canvas,
+        seed.agent_canvas,
     );
 
     let session_title = ctx
         .session_title
         .as_deref()
-        .map(|agent_name| compose_session_title(agent_name, channel_name));
+        .map(|agent_name| compose_session_title(agent_name, seed.channel_name));
     // Git-origin env goes on the configured servers only; the per-session
     // browser server is addressed by its own activity id, not by git origin.
     let mcp_servers: Vec<McpServer> = mcp_servers_with_git_origin(
         &ctx.mcp_servers,
-        channel_id,
-        channel_type,
+        seed.channel_id,
+        seed.channel_type,
         ctx.session_title.as_deref(),
     )
     .into_iter()
@@ -1908,11 +1923,13 @@ pub async fn run_prompt_task(
                         create_session_and_apply_model(
                             &mut agent,
                             &ctx,
-                            agent_core.as_deref(),
-                            agent_canvas.as_deref(),
-                            title_channel.as_deref(),
-                            Some(*cid),
-                            origin_channel_type.as_deref(),
+                            SessionSeed {
+                                agent_core: agent_core.as_deref(),
+                                agent_canvas: agent_canvas.as_deref(),
+                                channel_name: title_channel.as_deref(),
+                                channel_id: Some(*cid),
+                                channel_type: origin_channel_type.as_deref(),
+                            },
                             browser_servers,
                         )
                         .await
@@ -1967,14 +1984,10 @@ pub async fn run_prompt_task(
                 match create_session_and_apply_model(
                     &mut agent,
                     &ctx,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    SessionSeed::default(),
                     vec![],
                 )
-                    .await
+                .await
                 {
                     Ok(sid) => {
                         tracing::info!(
