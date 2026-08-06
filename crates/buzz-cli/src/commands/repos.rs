@@ -325,14 +325,13 @@ pub async fn cmd_rm_repo(client: &BuzzClient, repo_id: &str) -> Result<(), CliEr
     let coord = repo_coord_for(&me, repo_id);
     let builder = build_repo_rm_event(&coord)?;
     let event = client.sign_event(builder)?;
-    let event_id = event.id;
     let raw = client.submit_event(event).await?;
+
+    // One line, and it is the relay's JSON — every other command here prints
+    // exactly that. Appending human-readable `key   value` lines made the
+    // output neither JSON nor key/value, and a caller that parses either read
+    // an accepted deletion as a failure.
     println!("{}", validate_write_response(&raw)?);
-    println!(
-        "deleted    {KIND_GIT_REPO_ANNOUNCEMENT}:{}:{repo_id}",
-        me.to_hex()
-    );
-    println!("deletion   {}", event_id.to_hex());
     Ok(())
 }
 
