@@ -376,6 +376,53 @@ test("arrival at the physical floor does not preserve a stale unread state", asy
   await act(async () => root.unmount());
 });
 
+test("a reader's first scroll after the mount pin is not chased back to the floor", async () => {
+  const refs = {
+    container: { current: null },
+    content: { current: null },
+  };
+  const root = createRoot(document.createElement("div"));
+  const nodes = makePinnedCenterNodes();
+  refs.container.current = nodes.container;
+  refs.content.current = nodes.content;
+  let state = null;
+
+  await act(async () =>
+    root.render(
+      React.createElement(BottomStateHarness, {
+        messages: [{ id: "first" }],
+        onState: (nextState) => {
+          state = nextState;
+        },
+        refs,
+      }),
+    ),
+  );
+  // Let the mount pin's rAF chain run: the settle guard is now armed and no
+  // scroll event has arrived to clear it.
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+
+  const scrollWrites = [];
+  const scrollTo = nodes.container.scrollTo.bind(nodes.container);
+  nodes.container.scrollTo = (options) => {
+    scrollWrites.push(options.top);
+    scrollTo(options);
+  };
+
+  // The reader scrolls up before anything else touches the list.
+  nodes.container.scrollTop = 100;
+  await act(async () => state.onScroll());
+
+  assert.deepEqual(
+    scrollWrites,
+    [],
+    "the armed settle guard must not revert the reader's scroll",
+  );
+  assert.equal(nodes.container.scrollTop, 100);
+  assert.equal(state.isAtBottom, false);
+  await act(async () => root.unmount());
+});
+
 test("arrival does not steal an active layout target during floor-like reflow", async () => {
   const refs = {
     container: { current: null },

@@ -2,6 +2,7 @@ import * as React from "react";
 
 import { classifyTimelineMessageDelta } from "@/features/messages/lib/timelineSnapshot";
 import {
+  classifyProgrammaticBottomSettle,
   getPinnedCenterDrift,
   settleProgrammaticBottomPin,
   shouldIgnorePinnedCenterScroll,
@@ -203,6 +204,10 @@ export function useAnchoredScroll({
   // ignores transient gaps and keeps chasing the floor. A `ref`, not state — the
   // guard runs on a native scroll event, outside React's render cycle.
   const settlingRef = React.useRef(false);
+  // The scroll position the settle guard was armed at. Settling grows
+  // `scrollHeight` under a held `scrollTop`, so any move away from this value
+  // is the reader taking over — and the reader wins.
+  const settleArmScrollTopRef = React.useRef<number | null>(null);
   // Pinned-center corrections write scroll position themselves. Keep the next
   // matching scroll event from being mistaken for a user releasing the pin.
   const programmaticScrollTopRef = React.useRef<number | null>(null);
@@ -228,6 +233,7 @@ export function useAnchoredScroll({
     handledTargetIdRef.current = null;
     forceBottomOnNextAppendRef.current = false;
     settlingRef.current = false;
+    settleArmScrollTopRef.current = null;
     programmaticScrollTopRef.current = null;
     isWritingScrollRef.current = false;
     if (programmaticScrollRafRef.current !== null) {
@@ -369,6 +375,7 @@ export function useAnchoredScroll({
       } else {
         container.scrollTo({ top: container.scrollHeight, behavior });
       }
+      settleArmScrollTopRef.current = container.scrollTop;
       setIsAtBottom(true);
       setNewMessageCount(0);
     },
@@ -559,13 +566,25 @@ export function useAnchoredScroll({
     // above the true bottom. `computeAnchor` would read that as a deliberate
     // scroll-up and latch a message anchor, freezing the view short of bottom.
     // While settling, keep the anchor at-bottom and chase the physical floor.
+    // The guard clears on the settling scroll event, so an already-settled pin
+    // leaves it armed until the reader's own first scroll — which must never be
+    // chased back to the floor.
     if (settlingRef.current) {
-      if (settleProgrammaticBottomPin(container)) {
+      if (
+        classifyProgrammaticBottomSettle({
+          armedScrollTop: settleArmScrollTopRef.current,
+          container,
+        }) === "user-scroll"
+      ) {
         settlingRef.current = false;
+        settleArmScrollTopRef.current = null;
+      } else if (settleProgrammaticBottomPin(container)) {
+        settlingRef.current = false;
+        settleArmScrollTopRef.current = null;
       } else {
-        if (virtualizerOwnsPrependAnchoring) {
-          settlingRef.current = false;
-        }
+        // Still short of the floor. The chase just moved us, so re-arm from
+        // there — otherwise the next event reads our own write as a scroll.
+        settleArmScrollTopRef.current = container.scrollTop;
         return;
       }
     }
@@ -688,6 +707,7 @@ export function useAnchoredScroll({
       } else {
         container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
       }
+      settleArmScrollTopRef.current = container.scrollTop;
       setIsAtBottom(true);
       setNewMessageCount(0);
       prevLastMessageIdRef.current = lastMessage?.id;

@@ -42,6 +42,40 @@ export function settleProgrammaticBottomPin(
   );
 }
 
+// Sub-pixel jitter and rounding must not read as the reader taking control.
+const SETTLE_RELEASE_THRESHOLD_PX = 2;
+
+/**
+ * Decide who moved the scroller while a programmatic bottom pin is settling.
+ *
+ * Settling grows `scrollHeight` under a held `scrollTop`, so our own pin never
+ * moves the position it armed at. A reader who scrolls does move it — and must
+ * win, or the settle pass drags them back to the floor and strands the anchor
+ * at `at-bottom` for every later reflow to re-snap.
+ *
+ * A content *shrink* clamps `scrollTop` down without anyone scrolling. That
+ * still leaves the view on the floor, so the floor check keeps it a settle.
+ */
+export function classifyProgrammaticBottomSettle({
+  armedScrollTop,
+  container,
+}: {
+  armedScrollTop: number | null;
+  container: Omit<BottomSettleContainer, "scrollTo">;
+}): "settle" | "user-scroll" {
+  if (armedScrollTop === null) return "settle";
+  if (
+    Math.abs(container.scrollTop - armedScrollTop) <=
+    SETTLE_RELEASE_THRESHOLD_PX
+  ) {
+    return "settle";
+  }
+  return container.scrollHeight - container.clientHeight - container.scrollTop >
+    TRUE_BOTTOM_THRESHOLD_PX
+    ? "user-scroll"
+    : "settle";
+}
+
 export function shouldSettleForSplitPanel({
   isAtBottom,
   splitPanelOpen,
