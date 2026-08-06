@@ -262,10 +262,28 @@ export type OptionalWelcomeChannelResult =
   | { channel: null; unavailableReason: string };
 
 /**
- * Resolve the personal Welcome channel without letting its absence fail first
+ * A refusal means "this community does not offer a personal Welcome channel";
+ * anything else means "try again later". NIP-20 reserves `restricted:` and
+ * `blocked:` for authorization, and `channel_create_policy=owner-only` answers
+ * a member's create with `restricted: only workspace owners may create durable
+ * channels or forums` — surfaced as either `relay rejected event: …` or
+ * `relay returned 403 Forbidden: …`.
+ *
+ * The distinction is load-bearing: a transient channel read failure must stay
+ * an error, because tolerating it both marks the Welcome channel settled
+ * forever and lets first-run seed the channel cache from a relay we never
+ * actually reached.
+ */
+function isWelcomeChannelRefused(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  return message.includes("restricted:") || message.includes("blocked:");
+}
+
+/**
+ * Resolve the personal Welcome channel without letting a *refusal* fail first
  * run. Relays configured with `channel_create_policy=owner-only` reject the
  * create for every non-owner, so the private Welcome room is a nicety the
- * community may simply not offer.
+ * community may simply not offer. Transient failures still throw.
  */
 export async function ensureOptionalWelcomeChannel(
   client: WelcomeChannelClient,
@@ -274,6 +292,7 @@ export async function ensureOptionalWelcomeChannel(
   try {
     return { channel: await ensureWelcomeChannel(client, options) };
   } catch (error) {
+    if (!isWelcomeChannelRefused(error)) throw error;
     return {
       channel: null,
       unavailableReason:
