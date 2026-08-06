@@ -1593,6 +1593,21 @@ pub enum IssuesCmd {
         #[arg(long)]
         event: String,
     },
+    /// Delete one of your own issues, and everything published under it.
+    ///
+    /// kind:1621 is immutable and not addressable, so the deletion targets it
+    /// by event id (`e`). Its comments (kind:1) and status events
+    /// (kind:1630-1633) go first — the relay caps a kind:5 at exactly one
+    /// target, so this is one deletion per event, and children before parent
+    /// so a failure partway never orphans them.
+    ///
+    /// Unlike `repos rm` this is not reversible: the issue cannot be
+    /// re-announced under the same id.
+    Rm {
+        /// Issue event id (64-char hex). Only your own issues can be removed.
+        #[arg(long)]
+        issue: String,
+    },
     /// List issues for a repo
     List {
         /// Repo owner pubkey (64-char hex)
@@ -2148,7 +2163,7 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "issues"),
-            vec!["comment", "create", "get", "list", "status"]
+            vec!["comment", "create", "get", "list", "rm", "status"]
         );
         assert_eq!(names(&cmd, "media"), vec!["get"]);
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
@@ -2177,7 +2192,7 @@ mod tests {
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),
-            ("issues", 5),
+            ("issues", 6),
             ("media", 1),
             ("messages", 8),
             ("pack", 2),
