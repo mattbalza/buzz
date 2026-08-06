@@ -187,6 +187,19 @@ pub fn cleanup_stale_backup(
     Ok(())
 }
 
+/// Whether `word` can sit in a phrase joined by `separator` without hiding a
+/// word boundary.
+///
+/// The EFF short wordlist 2.0 contains one hyphenated entry (`yo-yo`), so a
+/// hyphen-joined phrase holding it reads as one more word than it has — both
+/// to a human retyping the phrase and to anything counting the parts. Dropping
+/// one of 1296 words costs ~0.001 bits per word.
+///
+/// An empty separator delimits nothing, so nothing is excluded.
+fn word_is_delimitable(word: &str, separator: &str) -> bool {
+    separator.is_empty() || !word.contains(separator)
+}
+
 /// Generate a passphrase of `word_count` EFF short-wordlist words joined by
 /// `separator`, using OS entropy.
 ///
@@ -196,6 +209,8 @@ pub fn cleanup_stale_backup(
 /// and re-drawn — the result always passes the same length gate applied to
 /// user-chosen passphrases. Uses rejection sampling for a uniform
 /// distribution over the 1296 words.
+///
+/// Words holding the separator are skipped — see [`word_is_delimitable`].
 pub fn generate_passphrase(word_count: usize, separator: &str) -> Result<String, String> {
     let word_count = word_count.clamp(MIN_PASSPHRASE_WORDS, MAX_PASSPHRASE_WORDS);
     let words: Vec<&str> = WORDLIST.lines().filter(|l| !l.is_empty()).collect();
@@ -218,7 +233,10 @@ pub fn generate_passphrase(word_count: usize, separator: &str) -> Result<String,
             // Rejection sampling: accept only values below the largest
             // multiple of 1296 that fits in u16 (65536 - 65536 % 1296 = 64800).
             if value < 64800 {
-                chosen.push(words[(value as usize) % 1296]);
+                let word = words[(value as usize) % 1296];
+                if word_is_delimitable(word, separator) {
+                    chosen.push(word);
+                }
             }
         }
         let phrase = chosen.join(separator);
