@@ -1241,6 +1241,22 @@ pub enum ReposCmd {
         #[arg(long)]
         channel: String,
     },
+    /// Delete one of your own repository announcements via NIP-09 (kind:5).
+    ///
+    /// Emits an a-tag-only deletion targeting `30617:<pubkey>:<id>` (no `e`
+    /// tag — an `e` tag routes around the relay's coordinate soft-delete and
+    /// leaves the announcement alive). Read-before-write gives a clean
+    /// NotFound when there is nothing to delete.
+    ///
+    /// The project disappears from clients that honour NIP-09; issues and
+    /// patches already published under the coordinate are orphaned, not
+    /// deleted. Re-announcing the same id later works — the coordinate is
+    /// soft-deleted, not reserved.
+    Rm {
+        /// Repository identifier (d-tag). Only your own repos can be removed.
+        #[arg(long)]
+        id: String,
+    },
     /// Manage branch and tag protection rules on one of your repositories.
     #[command(subcommand)]
     Protect(ReposProtectCmd),
@@ -2082,7 +2098,8 @@ mod tests {
                 "presence",
                 "set-presence",
                 "set-profile",
-                "set-status"
+                "set-status",
+                "whoami"
             ]
         );
         assert_eq!(
@@ -2104,7 +2121,7 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "repos"),
-            vec!["bind", "create", "get", "list", "protect"]
+            vec!["bind", "create", "get", "list", "protect", "rm"]
         );
         let repos = cmd
             .get_subcommands()
@@ -2131,7 +2148,7 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "issues"),
-            vec!["create", "get", "list", "status"]
+            vec!["comment", "create", "get", "list", "status"]
         );
         assert_eq!(names(&cmd, "media"), vec!["get"]);
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
@@ -2160,17 +2177,17 @@ mod tests {
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),
-            ("issues", 4),
+            ("issues", 5),
             ("media", 1),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),
             ("reactions", 3),
-            ("repos", 5),
+            ("repos", 6),
             ("social", 7),
             ("upload", 1),
-            ("users", 5),
+            ("users", 6),
             ("workflows", 8),
         ];
 
