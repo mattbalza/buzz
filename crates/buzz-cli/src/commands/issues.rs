@@ -2,6 +2,7 @@ use crate::client::BuzzClient;
 use crate::error::CliError;
 use crate::validate::{read_or_stdin, sdk_err, validate_hex64, validate_repo_id};
 use buzz_sdk::{GitIssueMeta, GitRepoCoord, GitStatusMeta};
+use nostr::{Event, EventBuilder, Tag};
 
 pub async fn cmd_create_issue(
     client: &BuzzClient,
@@ -172,6 +173,123 @@ pub async fn cmd_issue_status(
     Ok(())
 }
 
+/// Build the NIP-09 deletion event (kind:5) for one regular event.
+///
+/// Exactly one `e` tag and no `a` tag. Both halves are load-bearing: the relay
+/// rejects any kind:5 whose `e`+`a` tag count is not exactly 1, so a batch
+/// deletion is not expressible, and an `a` tag would route to the coordinate
+/// soft-delete path instead of the per-event one. kind:1621 is immutable and
+/// not addressable, so `e` is the only way to reach it.
+pub fn build_event_rm(target: &nostr::EventId) -> Result<EventBuilder, CliError> {
+    let e_tag = Tag::parse(["e", &target.to_hex()])
+        .map_err(|error| CliError::Other(format!("failed to build deletion tag: {error}")))?;
+    Ok(EventBuilder::new(nostr::Kind::EventDeletion, "").tags(vec![e_tag]))
+}
+
+fn parse_events(json: &str) -> Result<Vec<Event>, CliError> {
+    serde_json::from_str(json)
+        .map_err(|error| CliError::Other(format!("failed to parse relay response: {error}")))
+}
+
+/// Everything we published *under* an issue: comments (kind:1) and status
+/// events (kind:1630-1633), both anchored to it by `e`.
+///
+/// Filtered to our own pubkey because the relay refuses a deletion signed by
+/// anyone but the target's author — asking it to delete someone else's comment
+/// fails the whole command rather than skipping that one event.
+async fn fetch_own_issue_descendants(
+    client: &BuzzClient,
+    issue: &nostr::EventId,
+) -> Result<Vec<Event>, CliError> {
+    let filter = serde_json::json!({
+        "kinds": [1, 1630, 1631, 1632, 1633],
+        "authors": [client.keys().public_key().to_hex()],
+        "#e": [issue.to_hex()],
+    });
+    parse_events(&client.query(&filter).await?)
+}
+
+/// Fail loudly on a rejected deletion. Deliberately not reusing the repos
+/// module's checker: that one maps `duplicate` to a "repository changed
+/// concurrently, retry" conflict, which is both wrong and alarming here — a
+/// duplicate deletion is the outcome we wanted.
+fn ensure_accepted(raw: &str, target: &nostr::EventId) -> Result<(), CliError> {
+    let response: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| CliError::Other(format!("relay response is not JSON: {error} ({raw})")))?;
+    let accepted = response
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let message = response
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !accepted && !message.starts_with("duplicate") {
+        return Err(CliError::Other(format!(
+            "relay rejected deletion of {}: {message}",
+            target.to_hex()
+        )));
+    }
+    Ok(())
+}
+
+async fn delete_one(client: &BuzzClient, target: &nostr::EventId) -> Result<(), CliError> {
+    let event = client.sign_event(build_event_rm(target)?)?;
+    let raw = client.submit_event(event).await?;
+    ensure_accepted(&raw, target)
+}
+
+/// Delete an issue and everything published under it.
+///
+/// Children go first. A deletion is one event per target — the relay caps a
+/// kind:5 at exactly one — so this is several round trips, and a failure
+/// partway through must not leave comments anchored to an issue that is gone.
+pub async fn cmd_rm_issue(client: &BuzzClient, issue: &str) -> Result<(), CliError> {
+    validate_hex64(issue)?;
+    let issue_id = nostr::EventId::from_hex(issue)
+        .map_err(|error| CliError::Usage(format!("invalid issue event id: {error}")))?;
+
+    // Read-before-write, and read our *own* issue: a clean NotFound beats
+    // emitting deletions the relay will refuse for want of authorship.
+    let own = serde_json::json!({
+        "kinds": [1621],
+        "authors": [client.keys().public_key().to_hex()],
+        "ids": [issue],
+        "limit": 1,
+    });
+    if parse_events(&client.query(&own).await?)?.is_empty() {
+        return Err(CliError::NotFound(format!(
+            "no issue {issue:?} found for you ({}); nothing to delete",
+            client.keys().public_key().to_hex()
+        )));
+    }
+
+    let descendants = fetch_own_issue_descendants(client, &issue_id).await?;
+    let mut comments = 0_usize;
+    let mut statuses = 0_usize;
+    for child in &descendants {
+        delete_one(client, &child.id).await?;
+        if child.kind == nostr::Kind::TextNote {
+            comments += 1;
+        } else {
+            statuses += 1;
+        }
+    }
+    delete_one(client, &issue_id).await?;
+
+    // One line of JSON, like every other command here: a caller parses this.
+    println!(
+        "{}",
+        serde_json::json!({
+            "deleted": true,
+            "issue": issue,
+            "comments": comments,
+            "statuses": statuses,
+        })
+    );
+    Ok(())
+}
+
 pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), CliError> {
     use crate::IssuesCmd;
     match cmd {
@@ -191,6 +309,7 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             to,
         } => cmd_comment_issue(client, &repo_owner, &repo_id, &issue, &content, &to).await,
         IssuesCmd::Get { event } => cmd_get_issue(client, &event).await,
+        IssuesCmd::Rm { issue } => cmd_rm_issue(client, &issue).await,
         IssuesCmd::List {
             repo_owner,
             repo_id,
@@ -229,5 +348,55 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_event_rm, ensure_accepted};
+    use nostr::{EventId, Keys, Kind, Tag};
+
+    fn target() -> EventId {
+        EventId::from_hex(&"a".repeat(64)).expect("event id")
+    }
+
+    #[test]
+    fn issue_deletion_targets_exactly_one_event_by_e_tag() {
+        // The relay rejects any kind:5 whose e+a tag count is not exactly 1,
+        // and an `a` tag would route to the coordinate soft-delete path — which
+        // cannot reach kind:1621 at all, since issues are not addressable.
+        let keys = Keys::generate();
+        let event = build_event_rm(&target())
+            .expect("build deletion")
+            .sign_with_keys(&keys)
+            .expect("sign deletion");
+
+        assert_eq!(event.kind, Kind::EventDeletion);
+        assert_eq!(
+            event.tags.iter().map(Tag::as_slice).collect::<Vec<_>>(),
+            vec![["e".to_string(), "a".repeat(64)].as_slice()],
+        );
+    }
+
+    #[test]
+    fn a_duplicate_deletion_is_the_outcome_we_wanted_not_an_error() {
+        // Deleting twice must stay quiet: the second call is how a partially
+        // failed purge is retried.
+        ensure_accepted(r#"{"accepted":false,"message":"duplicate"}"#, &target())
+            .expect("duplicate deletion is success");
+    }
+
+    #[test]
+    fn a_refused_deletion_names_the_event_it_could_not_delete() {
+        // One purge emits many deletions; "rejected" without the id is useless.
+        let error = ensure_accepted(
+            r#"{"accepted":false,"message":"must be event author"}"#,
+            &target(),
+        )
+        .expect_err("refusal must fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("must be event author"), "{rendered}");
+        assert!(rendered.contains(&"a".repeat(64)), "{rendered}");
     }
 }
