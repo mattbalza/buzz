@@ -210,6 +210,35 @@ fn generated_passphrase_respects_word_count_and_separator() {
 }
 
 #[test]
+fn hyphenated_wordlist_entry_is_excluded_from_hyphen_joined_phrases() {
+    // `yo-yo` is the wordlist's only entry holding a separator we use. Before
+    // it was skipped it turned a 10-word phrase into 11 parts, failing roughly
+    // one CI run in a hundred.
+    assert!(!word_is_delimitable("yo-yo", "-"));
+    assert!(word_is_delimitable("yo-yo", " "));
+    assert!(word_is_delimitable("yo-yo", ""));
+    assert!(word_is_delimitable("acid", "-"));
+    assert_eq!(
+        WORDLIST
+            .lines()
+            .filter(|word| !word_is_delimitable(word, "-"))
+            .collect::<Vec<_>>(),
+        vec!["yo-yo"],
+        "a new hyphenated entry would need the same treatment"
+    );
+}
+
+#[test]
+fn generated_phrases_never_hide_a_word_boundary() {
+    // 512 × 10 words: pre-fix the odds of never drawing `yo-yo` here are ~2e-2,
+    // so this is a guard rail, not the primary assertion above.
+    for _ in 0..512 {
+        let phrase = generate_passphrase(MAX_PASSPHRASE_WORDS, "-").unwrap();
+        assert_eq!(phrase.split('-').count(), MAX_PASSPHRASE_WORDS);
+    }
+}
+
+#[test]
 fn generated_passphrase_clamps_word_count() {
     // Below the floor: clamped up to MIN_PASSPHRASE_WORDS, never shorter.
     let phrase = generate_passphrase(1, "-").unwrap();

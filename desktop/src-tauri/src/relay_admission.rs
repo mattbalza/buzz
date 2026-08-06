@@ -96,23 +96,49 @@ pub fn reset_gate_for_workspace_change() {
 /// Reset the gate. Test-only: production never clears an armed window early
 /// except via `reset_gate_for_workspace_change`.
 #[cfg(test)]
-pub fn reset_rate_limit_gate() {
+fn reset_rate_limit_gate() {
     *GATE_EXPIRY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Exclusive, self-clearing access to the gate for the duration of one test.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// The gate is a process-wide static and Rust runs tests in parallel
+    /// threads, so every test that arms it must serialize here — including
+    /// tests in other modules that reach it indirectly through
+    /// `relay::relay_error_message`, which arms the gate on any 429.
+    static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Holds the serial lock and clears the gate on both acquire and drop, so
+    /// a test can neither inherit another's armed window nor bequeath its own.
+    ///
+    /// A leaked window is not a small error: a waiter parked on its own 2s
+    /// expiry re-reads the static and adopts whatever it now holds, so one
+    /// unserialized 300s arming makes an unrelated test wait 300s.
+    pub(crate) struct GateGuard {
+        _serial: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            super::reset_rate_limit_gate();
+        }
+    }
+
+    pub(crate) async fn lock_gate() -> GateGuard {
+        let serial = TEST_SERIAL.lock().await;
+        super::reset_rate_limit_gate();
+        GateGuard { _serial: serial }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The gate is a process-wide static shared by every test in this binary,
-    // so all gate tests serialize on one async lock to keep armed expiries
-    // from bleeding between parallel test threads.
-    pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[tokio::test(start_paused = true)]
     async fn wait_returns_immediately_when_gate_is_inactive() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         let start = Instant::now();
         wait_for_rate_limit().await;
         assert_eq!(
@@ -124,19 +150,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn hintless_429_arms_the_ten_second_default() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         activate_rate_limit(None);
         let start = Instant::now();
         wait_for_rate_limit().await;
         assert_eq!(Instant::now() - start, Duration::from_secs(10));
-        reset_rate_limit_gate();
     }
 
     #[tokio::test(start_paused = true)]
     async fn shorter_hint_never_shrinks_an_active_window() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         activate_rate_limit(Some(8));
         activate_rate_limit(Some(1));
         let start = Instant::now();
@@ -146,13 +169,11 @@ mod tests {
             Duration::from_secs(8),
             "the 1s hint must not shorten the active 8s window"
         );
-        reset_rate_limit_gate();
     }
 
     #[tokio::test(start_paused = true)]
     async fn concurrent_429_extends_the_window_for_parked_waiters() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         activate_rate_limit(Some(2));
         let start = Instant::now();
         let waiter = tokio::spawn(async {
@@ -167,15 +188,37 @@ mod tests {
             Duration::from_secs(5),
             "waiter must respect the extension armed mid-sleep (1s + 4s)"
         );
-        reset_rate_limit_gate();
+    }
+
+    /// No armed window may outlive the guard that armed it.
+    ///
+    /// This is the invariant a 300s window leaking out of
+    /// `relay::tests::oversized_hint_is_capped_in_relay_error_message_string`
+    /// broke: the waiter above re-reads the static after its own expiry and
+    /// adopts whatever it finds, so it waited 300s for a 5s window.
+    #[tokio::test(start_paused = true)]
+    async fn an_armed_window_does_not_outlive_its_guard() {
+        let gate = test_support::lock_gate().await;
+        activate_rate_limit(Some(MAX_HINT_SECONDS));
+        drop(gate);
+
+        // Robust against a concurrent gate test winning the lock in between:
+        // whoever holds it also hands it back clear.
+        let _gate = test_support::lock_gate().await;
+        let start = Instant::now();
+        wait_for_rate_limit().await;
+        assert_eq!(
+            Instant::now(),
+            start,
+            "the next holder of the guard must inherit a clear gate"
+        );
     }
 
     // ── hint capping and overflow safety ─────────────────────────────────────
 
     #[tokio::test(start_paused = true)]
     async fn hint_zero_uses_default() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         activate_rate_limit(Some(0));
         let start = Instant::now();
         wait_for_rate_limit().await;
@@ -184,13 +227,11 @@ mod tests {
             Duration::from_secs(DEFAULT_RATE_LIMIT_SECONDS),
             "hint=0 must use the default"
         );
-        reset_rate_limit_gate();
     }
 
     #[tokio::test(start_paused = true)]
     async fn hint_at_max_is_honoured() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         activate_rate_limit(Some(MAX_HINT_SECONDS));
         let start = Instant::now();
         wait_for_rate_limit().await;
@@ -199,13 +240,11 @@ mod tests {
             Duration::from_secs(MAX_HINT_SECONDS),
             "hint at the cap must be honoured in full"
         );
-        reset_rate_limit_gate();
     }
 
     #[tokio::test(start_paused = true)]
     async fn oversize_hint_is_clamped_to_max() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         // An oversize hint (including u64::MAX) must clamp rather than panic.
         activate_rate_limit(Some(u64::MAX));
         let start = Instant::now();
@@ -215,15 +254,13 @@ mod tests {
             Duration::from_secs(MAX_HINT_SECONDS),
             "u64::MAX hint must clamp to MAX_HINT_SECONDS"
         );
-        reset_rate_limit_gate();
     }
 
     // ── community / workspace boundary ───────────────────────────────────────
 
     #[tokio::test(start_paused = true)]
     async fn workspace_change_clears_armed_gate() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         activate_rate_limit(Some(60));
         // Switch workspace — gate for community A must not stall community B.
         reset_gate_for_workspace_change();
@@ -238,8 +275,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn community_a_gate_does_not_block_community_b() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
         // Community A gets a 429 with a 30s window.
         activate_rate_limit(Some(30));
         // Community switch.
@@ -264,8 +300,7 @@ mod tests {
     async fn gate_armed_by_one_path_withholds_another_path() {
         use std::io::{Read, Write};
 
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
 
         // The loopback server answers every request with 200 [].
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -312,7 +347,6 @@ mod tests {
         );
 
         drop(server);
-        reset_rate_limit_gate();
     }
 
     /// A waiter parked on community A's gate must NOT wake early when the gate
@@ -326,8 +360,7 @@ mod tests {
     /// is the same bound as if the workspace had not changed.
     #[tokio::test(start_paused = true)]
     async fn parked_waiter_does_not_wake_early_after_workspace_reset() {
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
 
         // Arm a 5s gate for community A.
         activate_rate_limit(Some(5));
@@ -356,8 +389,6 @@ mod tests {
             "waiter woke at {}ms — must not wake before A's 5s expiry even after reset",
             elapsed.as_millis()
         );
-
-        reset_rate_limit_gate();
     }
 
     /// Wait-then-sign ensures NIP-98 auth is fresh after an admission wait.
@@ -375,8 +406,7 @@ mod tests {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
         use serde::Deserialize;
 
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
 
         // Arm the gate for 1s (real time — NIP-98 uses SystemTime, not Tokio clock).
         activate_rate_limit(Some(1));
@@ -420,8 +450,6 @@ mod tests {
             shell.created_at,
             wake_unix
         );
-
-        reset_rate_limit_gate();
     }
 
     /// Acceptance: a 429 from one relay-backed command withholds the next
@@ -435,8 +463,7 @@ mod tests {
     async fn http_429_withholds_next_relay_command_until_expiry_then_resumes() {
         use std::io::{Read, Write};
 
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -499,6 +526,5 @@ mod tests {
         );
 
         server.join().unwrap();
-        reset_rate_limit_gate();
     }
 }
