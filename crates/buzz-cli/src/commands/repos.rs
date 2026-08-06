@@ -280,6 +280,62 @@ pub async fn cmd_create_repo(
     Ok(())
 }
 
+/// Build the NIP-09 deletion event (kind:5) for a repository coordinate.
+///
+/// The deletion carries **only** an `a` tag (`30617:<pubkey>:<id>`) and no `e`
+/// tag. This is load-bearing: the relay routes to its coordinate soft-delete
+/// path *only* when the kind:5 has no `e` target ids
+/// (`handle_standard_deletion_event` → `handle_a_tag_deletion`). An `e` tag
+/// would route to the per-event path and leave the live replaceable row
+/// intact — the announcement would survive the "deletion". Pure and
+/// unit-testable; mirrors `notes::build_rm_event`.
+pub fn build_repo_rm_event(
+    coord: &nostr::nips::nip01::Coordinate,
+) -> Result<EventBuilder, CliError> {
+    let a_tag = Tag::parse(["a", &coord.to_string()])
+        .map_err(|error| CliError::Other(format!("failed to build deletion tag: {error}")))?;
+    Ok(EventBuilder::new(nostr::Kind::EventDeletion, "").tags(vec![a_tag]))
+}
+
+pub fn repo_coord_for(author: &nostr::PublicKey, repo_id: &str) -> nostr::nips::nip01::Coordinate {
+    nostr::nips::nip01::Coordinate::new(
+        nostr::Kind::Custom(KIND_GIT_REPO_ANNOUNCEMENT as u16),
+        *author,
+    )
+    .identifier(repo_id.to_string())
+}
+
+pub async fn cmd_rm_repo(client: &BuzzClient, repo_id: &str) -> Result<(), CliError> {
+    validate_repo_id(repo_id)?;
+
+    // Read-before-write: only the author can delete their own announcement,
+    // and a clean "nothing to delete" beats emitting a kind:5 for a
+    // coordinate that was never published.
+    let me = client.keys().public_key();
+    if fetch_own_repo_announcement(client, repo_id)
+        .await?
+        .is_none()
+    {
+        return Err(CliError::NotFound(format!(
+            "no repository {repo_id:?} found for you ({}); nothing to delete",
+            me.to_hex()
+        )));
+    }
+
+    let coord = repo_coord_for(&me, repo_id);
+    let builder = build_repo_rm_event(&coord)?;
+    let event = client.sign_event(builder)?;
+    let event_id = event.id;
+    let raw = client.submit_event(event).await?;
+    println!("{}", validate_write_response(&raw)?);
+    println!(
+        "deleted    {KIND_GIT_REPO_ANNOUNCEMENT}:{}:{repo_id}",
+        me.to_hex()
+    );
+    println!("deletion   {}", event_id.to_hex());
+    Ok(())
+}
+
 pub async fn cmd_get_repo(
     client: &BuzzClient,
     repo_id: &str,
@@ -444,6 +500,7 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
         ReposCmd::Get { id, owner } => cmd_get_repo(client, &id, owner.as_deref()).await,
         ReposCmd::List { owner, limit } => cmd_list_repos(client, owner.as_deref(), limit).await,
         ReposCmd::Bind { id, channel } => cmd_bind_repo(client, &id, &channel).await,
+        ReposCmd::Rm { id } => cmd_rm_repo(client, &id).await,
         ReposCmd::Protect(command) => match command {
             ReposProtectCmd::List { id } => cmd_protect_list(client, &id).await,
             ReposProtectCmd::Set {
@@ -477,8 +534,9 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     use super::{
-        build_create_announcement, build_protection_tag, build_updated_repo_announcement,
-        protection_rules_json, validate_write_response, RepoChange,
+        build_create_announcement, build_protection_tag, build_repo_rm_event,
+        build_updated_repo_announcement, protection_rules_json, repo_coord_for,
+        validate_write_response, RepoChange,
     };
 
     fn signed_repo(tags: Vec<Tag>, content: &str, created_at: u64) -> nostr::Event {
@@ -852,6 +910,44 @@ mod tests {
                 "accepted": true,
                 "message": "saved",
             })
+        );
+    }
+
+    #[test]
+    fn repo_deletion_carries_only_the_coordinate_and_never_an_e_tag() {
+        // An `e` tag would route the relay to its per-event delete path and
+        // leave the live replaceable row intact — the repo would survive.
+        let keys = Keys::generate();
+        let coord = repo_coord_for(&keys.public_key(), "scalarly-erp");
+
+        let event = build_repo_rm_event(&coord)
+            .expect("build deletion")
+            .sign_with_keys(&keys)
+            .expect("sign deletion");
+
+        assert_eq!(event.kind, Kind::EventDeletion);
+        assert_eq!(
+            event.tags.iter().map(Tag::as_slice).collect::<Vec<_>>(),
+            vec![[
+                "a".to_string(),
+                format!("30617:{}:scalarly-erp", keys.public_key().to_hex())
+            ]
+            .as_slice()],
+        );
+        assert!(!event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice().first().map(String::as_str) == Some("e")));
+    }
+
+    #[test]
+    fn repo_coordinate_matches_the_announcement_kind_desktop_filters_on() {
+        // Desktop's isDeletedByA compares this string to `30617:<owner>:<dtag>`;
+        // any other kind here silently fails to hide the project.
+        let keys = Keys::generate();
+        assert_eq!(
+            repo_coord_for(&keys.public_key(), "demo").to_string(),
+            format!("30617:{}:demo", keys.public_key().to_hex()),
         );
     }
 }
