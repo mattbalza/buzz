@@ -5,7 +5,7 @@ import {
   coalesceAgentAutocompleteCandidates,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
-  isAgentIdentityDiscoverable,
+  isAgentIdentityInManagedList,
   relayAgentIsSharedWithUser,
   shouldHideAgentFromMentions,
 } from "./agentAutocompleteEligibility.ts";
@@ -136,39 +136,29 @@ test("getMentionableAgentPubkeys: keeps managed agents and shared relay agents",
   assert.deepEqual(result, new Set([PUB_A, PUB_B, PUB_C]));
 });
 
-test("isAgentIdentityDiscoverable: keeps people and locally managed agent identities", () => {
+test("isAgentIdentityInManagedList: keeps people and only current managed agent identities", () => {
   const managedAgentPubkeys = new Set([PUB_A]);
 
   assert.equal(
-    isAgentIdentityDiscoverable(
+    isAgentIdentityInManagedList(
       { isAgent: false, pubkey: PUB_B },
       managedAgentPubkeys,
     ),
     true,
   );
   assert.equal(
-    isAgentIdentityDiscoverable(
+    isAgentIdentityInManagedList(
       { isAgent: true, pubkey: PUB_A.toUpperCase() },
       managedAgentPubkeys,
     ),
     true,
   );
   assert.equal(
-    isAgentIdentityDiscoverable(
+    isAgentIdentityInManagedList(
       { isAgent: true, pubkey: PUB_B },
       managedAgentPubkeys,
     ),
     false,
-  );
-});
-
-test("isAgentIdentityDiscoverable: keeps channel-member agents managed on another device", () => {
-  assert.equal(
-    isAgentIdentityDiscoverable(
-      { isAgent: true, isMember: true, pubkey: PUB_B },
-      new Set(),
-    ),
-    true,
   );
 });
 
@@ -179,6 +169,7 @@ test("shouldHideAgentFromMentions: never hides non-agents", () => {
       isMember: false,
       pubkey: PUB_A,
       mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set([PUB_A]),
     }),
     false,
   );
@@ -191,6 +182,7 @@ test("shouldHideAgentFromMentions: shows invocable agents even when non-member",
       isMember: false,
       pubkey: PUB_A,
       mentionableAgentPubkeys: new Set([PUB_A]),
+      directoryAgentPubkeys: new Set([PUB_A]),
     }),
     false,
   );
@@ -203,20 +195,22 @@ test("shouldHideAgentFromMentions: hides non-member non-invocable agents", () =>
       isMember: false,
       pubkey: PUB_A,
       mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set(),
     }),
     true,
   );
 });
 
-test("shouldHideAgentFromMentions: shows member agents even when the local owner is unavailable", () => {
+test("shouldHideAgentFromMentions: hides member agents with an explicit not-invocable directory entry (Fizz)", () => {
   assert.equal(
     shouldHideAgentFromMentions({
       isAgent: true,
       isMember: true,
       pubkey: PUB_A,
       mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set([PUB_A]),
     }),
-    false,
+    true,
   );
 });
 
@@ -227,6 +221,7 @@ test("shouldHideAgentFromMentions: shows member agents with unknown invocability
       isMember: true,
       pubkey: PUB_A,
       mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set(),
     }),
     false,
   );
@@ -239,11 +234,12 @@ test("shouldHideAgentFromMentions: normalizes the pubkey before lookup", () => {
   assert.equal(
     shouldHideAgentFromMentions({
       isAgent: true,
-      isMember: false,
+      isMember: true,
       pubkey: mixedCase,
-      mentionableAgentPubkeys: new Set([normalized]),
+      mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set([normalized]),
     }),
-    false,
+    true,
   );
 });
 

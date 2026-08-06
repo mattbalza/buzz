@@ -16,7 +16,7 @@ import {
   coalesceAutocompleteCandidatesByKey,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
-  isAgentIdentityDiscoverable,
+  isAgentIdentityInManagedList,
   shouldHideAgentFromMentions,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import {
@@ -179,6 +179,15 @@ export function useMentions(
       ),
     [relayAgentsQuery.data],
   );
+  const directoryAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (relayAgentsQuery.data ?? []).map((agent) =>
+          normalizePubkey(agent.pubkey),
+        ),
+      ),
+    [relayAgentsQuery.data],
+  );
   const sharedChannelIds = React.useMemo(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
@@ -237,7 +246,7 @@ export function useMentions(
       if (isArchivedDiscovery(pubkey)) {
         return;
       }
-      if (!isAgentIdentityDiscoverable(candidate, managedAgentPubkeys)) {
+      if (!isAgentIdentityInManagedList(candidate, managedAgentPubkeys)) {
         return;
       }
       if (
@@ -246,6 +255,7 @@ export function useMentions(
           isMember: candidate.isMember === true,
           pubkey,
           mentionableAgentPubkeys,
+          directoryAgentPubkeys,
         })
       ) {
         return;
@@ -405,6 +415,7 @@ export function useMentions(
     userSearchResults,
     canSearchGlobalUsers,
     currentPubkey,
+    directoryAgentPubkeys,
     isArchivedDiscovery,
     managedAgentNamesByPubkey,
     managedAgentPersonaIds,

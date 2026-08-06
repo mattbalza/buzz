@@ -209,10 +209,7 @@ test("@ trigger prioritizes channel members before runnable personas and other m
 
   const dropdown = autocomplete(page);
   await expect(dropdown).toBeVisible();
-  // alice is relay-classified as an agent and is an owner-member of #general —
-  // i.e. an agent someone else runs. Being in the channel is what makes her
-  // mentionable here; nobody on this device manages her.
-  await expect(dropdown.getByText("alice")).toBeVisible();
+  await expect(dropdown.getByText("alice")).toHaveCount(0);
   await expect(dropdown.getByText("bob")).toBeVisible();
   await expect(dropdown.getByText("Fizz")).toBeVisible();
   await expect(dropdown.getByText("charlie")).toBeVisible();
@@ -220,13 +217,11 @@ test("@ trigger prioritizes channel members before runnable personas and other m
   const charlieRow = dropdown.locator("button", { hasText: "charlie" });
   await expect(charlieRow.getByTestId("mention-agent-icon")).toBeVisible();
   await expect(charlieRow.getByText("not in channel")).toBeVisible();
-  // ...and because she is in it, she carries no "not in channel" caveat, which
-  // is the whole difference between her row and charlie's.
   await expect(
     dropdown
       .locator("button", { hasText: "alice" })
       .getByText("not in channel"),
-  ).toHaveCount(0);
+  ).not.toBeVisible();
 
   const suggestions = dropdown.locator("button");
   const suggestionText = await suggestions.allInnerTexts();
