@@ -606,6 +606,76 @@ test("selecting a person mention inserts @Name into input", async ({
   await expect(mentionChip).not.toHaveClass(/agent-mention-highlight/);
 });
 
+test("clicking past the end of a mention chip puts the caret outside the handle", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const input = page.getByTestId("message-input");
+  await input.fill("Hey @bo");
+  await autocomplete(page).getByText("bob").click();
+  await expect(input).toHaveText("Hey @bob ");
+  await page.keyboard.type("tail");
+  await expect(input).toHaveText("Hey @bob tail");
+
+  const chip = input.locator(".mention-chip", { hasText: "@bob" });
+  const geometry = await chip.evaluate((el) => {
+    const glyphs = document.createRange();
+    glyphs.selectNodeContents(el.firstChild as Node);
+    const glyphRects = glyphs.getClientRects();
+    const box = el.getBoundingClientRect();
+
+    // The space that follows the chip, measured on its own: the caret band
+    // that belongs to it is the only part of this line whose width is a font
+    // metric rather than a style we choose.
+    const after = el.nextSibling;
+    const space = document.createRange();
+    space.setStart(after as Node, 0);
+    space.setEnd(after as Node, 1);
+    const spaceRect = space.getBoundingClientRect();
+
+    return {
+      band: box.right - glyphRects[glyphRects.length - 1].right,
+      spaceWidth: spaceRect.width,
+      // Three quarters into the space glyph — past its midpoint on any font,
+      // so this resolves to the position *after* the space everywhere.
+      probeX: spaceRect.left + spaceRect.width * 0.75,
+      y: box.y + box.height / 2,
+    };
+  });
+
+  // This is the regression pin, and it is font-independent: the chip's painted
+  // box must not extend past its last glyph. Every pixel that is visually after
+  // the name but still inside the chip resolves to the position *before* the
+  // trailing space — inside the handle — so the user aims just after the name,
+  // the caret lands in it, and the next keystroke turns "@bob " into "@bobx".
+  expect(geometry.band).toBeLessThanOrEqual(0.5);
+
+  // And the caret behaves: clicking in the space after the name types after the
+  // name. (A click nearer the glyph cannot be asserted portably — the trapping
+  // band that is left is half a space wide, and a space is not the same width
+  // on every platform.)
+  expect(geometry.spaceWidth).toBeGreaterThan(0);
+  await page.mouse.click(geometry.probeX, geometry.y);
+  const caretInChip = await page.evaluate(() => {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return true;
+    const node = selection.getRangeAt(0).startContainer;
+    const element =
+      node.nodeType === Node.ELEMENT_NODE
+        ? (node as HTMLElement)
+        : node.parentElement;
+    return !!element?.closest(".mention-chip");
+  });
+  expect(caretInChip).toBe(false);
+
+  await page.keyboard.type("Z");
+  await expect(input).toHaveText("Hey @bob Ztail");
+  await expect(chip).toHaveText("@bob");
+});
+
 test("selecting a managed agent mention inserts @Name into input", async ({
   page,
 }) => {

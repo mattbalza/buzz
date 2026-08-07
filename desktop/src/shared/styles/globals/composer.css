@@ -99,6 +99,26 @@
   line-height: var(--text-sm--line-height);
 }
 
+/* Mention chips are inline decorations over live, editable text, so their box
+   is also a click target for caret placement. `--inline-chip-padding-inline`
+   (0.25rem in markdown.css) paints 4px of chip past the last glyph, and a click
+   in that band resolves to the position *before* the trailing space — inside
+   the handle. The user aims just after the name, the caret lands in it, and the
+   next keystroke turns "@bob " into "@bobx".
+
+   Measured against `.mention-chip` in the composer: the trap band is exactly
+   the inline padding — 4.0px at the default, 0.0px here. Display mode is not
+   involved; `inline` and `inline-flex` hit-test identically.
+
+   Zeroing the variable (rather than the padding) keeps the agent chip's
+   derived geometry consistent: its `padding-left` stays icon + gap and its
+   `::before` robot icon simply moves flush to the chip's left edge. Rendered
+   messages are untouched — they are not editable, so the band costs nothing
+   there and the padded pill is the intended look. */
+.rich-text-composer .tiptap {
+  --inline-chip-padding-inline: 0;
+}
+
 .rich-text-composer .tiptap p {
   margin: 0;
 }
