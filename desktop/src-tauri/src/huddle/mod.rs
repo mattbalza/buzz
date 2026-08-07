@@ -23,8 +23,11 @@
 //!    takes `stt_pipeline`/`tts_pipeline` out of the lock, then calls `shutdown()`
 //!    and drops them outside the lock (thread joins can block ~200ms).
 
+mod agent_tts_routing;
+pub mod agent_voice;
 pub mod agents;
 pub mod audio_output;
+mod commands;
 pub mod jitter;
 pub mod models;
 pub mod pipeline;
@@ -37,6 +40,10 @@ pub mod state;
 pub mod stt;
 pub mod transcription;
 pub mod tts;
+pub mod tts_settings;
+mod tts_voice_import;
+mod tts_voice_registry;
+mod window;
 pub mod wire;
 
 // ── Shared utilities ──────────────────────────────────────────────────────────
@@ -61,8 +68,13 @@ pub(super) fn drain_until_shutdown<T>(
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
+pub use commands::{
+    interrupt_huddle_speech, remove_agent_from_huddle, set_huddle_manual_mic_unmuted,
+};
 pub use state::{HuddleJoinInfo, HuddlePhase, HuddleState, VoiceInputMode};
 pub use transcription::{set_huddle_transcription_enabled, start_stt_pipeline};
+pub use tts_settings::set_tts_enabled;
+pub use window::{close_huddle_companion, open_huddle_window};
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
@@ -71,15 +83,21 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::{app_state::AppState, events, relay::submit_event};
+
+use agent_tts_routing::{
+    classify_agent_tts_runtime, enqueue_agent_tts_text, normalize_agent_tts_text,
+    AgentTtsRuntimeGate,
+};
 pub use pipeline::check_pipeline_hotstart;
 use pipeline::{
-    maybe_start_stt_pipeline, maybe_start_tts_pipeline, post_connect_setup,
-    start_auto_enabled_transcription, PostConnectOutcome,
+    await_inflight_tts_start, maybe_start_stt_pipeline, maybe_start_tts_pipeline,
+    post_connect_setup, start_auto_enabled_transcription, PostConnectOutcome,
 };
 use relay_api::{
     count_human_members, fetch_channel_members, parse_channel_uuid, validate_pubkey_hex,
     MAX_HUDDLE_AGENTS,
 };
+use window::close_huddle_window;
 
 fn normalize_huddle_channel_name(candidate: Option<String>, fallback: &str) -> String {
     let normalized = candidate
@@ -165,6 +183,7 @@ pub async fn start_huddle(
     parent_channel_id: String,
     member_pubkeys: Vec<String>,
     channel_name: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<HuddleJoinInfo, String> {
     // Validate inputs at the Tauri boundary.
@@ -188,6 +207,15 @@ pub async fn start_huddle(
         deduped
     };
 
+    // Allocate the backing channel ID before the relay work starts. Publishing
+    // it with the Creating state lets the main webview open an immediate
+    // companion window while the channel and audio session are being prepared.
+    let ephemeral_uuid = Uuid::new_v4();
+    let ephemeral_channel_id = ephemeral_uuid.to_string();
+    let short_id = &ephemeral_channel_id[..8];
+    let fallback_channel_name = format!("huddle-{short_id}");
+    let channel_name = normalize_huddle_channel_name(channel_name, &fallback_channel_name);
+
     // Transition to Creating.
     let huddle_generation = {
         let mut hs = state.huddle()?;
@@ -200,20 +228,16 @@ pub async fn start_huddle(
         let generation = hs.begin_huddle_lifetime();
         hs.phase = HuddlePhase::Creating;
         hs.parent_channel_id = Some(parent_channel_id.clone());
+        hs.ephemeral_channel_id = Some(ephemeral_channel_id.clone());
         generation
     };
-
-    let ephemeral_uuid = Uuid::new_v4();
-    let ephemeral_channel_id = ephemeral_uuid.to_string();
-    let short_id = &ephemeral_channel_id[..8];
-    let fallback_channel_name = format!("huddle-{short_id}");
-    let channel_name = normalize_huddle_channel_name(channel_name, &fallback_channel_name);
+    state.emit_huddle_state_changed();
 
     // All steps wrapped so we can roll back on ANY failure, including step 1.
     // channel_was_created tracks whether we need to archive on rollback.
     let mut channel_was_created = false;
 
-    let result: Result<Vec<String>, String> = async {
+    let result: Result<(Vec<String>, String), String> = async {
         // 1. Create ephemeral channel.
         let create_builder = events::build_create_channel(
             ephemeral_uuid,
@@ -255,14 +279,14 @@ pub async fn start_huddle(
         // 4. Emit HUDDLE_STARTED to parent channel.
         let started_builder =
             events::build_huddle_started(&parent_channel_id, &ephemeral_channel_id)?;
-        submit_event(started_builder, &state).await?;
+        let started_event = submit_event(started_builder, &state).await?;
 
-        Ok(successful_agents)
+        Ok((successful_agents, started_event.event_id))
     }
     .await;
 
     match result {
-        Ok(successful_agents) => {
+        Ok((successful_agents, huddle_thread_event_id)) => {
             // 5. Store active state.
             let committed = {
                 let mut hs = state.huddle()?;
@@ -272,6 +296,7 @@ pub async fn start_huddle(
                     hs.phase = HuddlePhase::Connected;
                     hs.is_creator = true;
                     hs.ephemeral_channel_id = Some(ephemeral_channel_id.clone());
+                    hs.huddle_thread_event_id = Some(huddle_thread_event_id);
                     *hs.agent_pubkeys.lock().unwrap_or_else(|e| e.into_inner()) =
                         successful_agents.clone();
                     hs.maybe_auto_enable_transcription_for_agents();
@@ -290,6 +315,7 @@ pub async fn start_huddle(
             };
             if !committed {
                 emit_end_and_archive(&parent_channel_id, &ephemeral_channel_id, &state).await;
+                close_huddle_window(&app, &ephemeral_channel_id);
                 return Err("huddle start was superseded".to_owned());
             }
 
@@ -301,6 +327,7 @@ pub async fn start_huddle(
             match post_connect_setup(&state, &ephemeral_channel_id, huddle_generation).await {
                 Ok(PostConnectOutcome::Ready) => {}
                 Ok(PostConnectOutcome::Stale) => {
+                    close_huddle_window(&app, &ephemeral_channel_id);
                     return Err("huddle start was superseded".to_owned());
                 }
                 Err(e) => {
@@ -320,6 +347,7 @@ pub async fn start_huddle(
                         }
                         state.emit_huddle_state_changed();
                     }
+                    close_huddle_window(&app, &ephemeral_channel_id);
                     return Err(e);
                 }
             }
@@ -340,10 +368,19 @@ pub async fn start_huddle(
                 }
             }
             // Reset only if this failed attempt still owns the Creating state.
-            if let Ok(mut hs) = state.huddle_state.lock() {
+            let reset = if let Ok(mut hs) = state.huddle_state.lock() {
                 if hs.owns_huddle_lifetime(huddle_generation, HuddlePhase::Creating) {
                     hs.reset_preserving_generation();
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if reset {
+                state.emit_huddle_state_changed();
+                close_huddle_window(&app, &ephemeral_channel_id);
             }
             Err(e)
         }
@@ -362,6 +399,7 @@ pub async fn start_huddle(
 pub async fn join_huddle(
     parent_channel_id: String,
     ephemeral_channel_id: String,
+    huddle_thread_event_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<HuddleJoinInfo, String> {
     // Transition to Connecting.
@@ -377,6 +415,7 @@ pub async fn join_huddle(
         hs.phase = HuddlePhase::Connecting;
         hs.parent_channel_id = Some(parent_channel_id.clone());
         hs.ephemeral_channel_id = Some(ephemeral_channel_id.clone());
+        hs.huddle_thread_event_id = huddle_thread_event_id;
         generation
     };
 
@@ -547,7 +586,7 @@ async fn remove_huddle_agents(ephemeral_channel_id: &str, state: &AppState) {
 ///
 /// The relay emits kind:48102 (participant left) when the audio WS disconnects.
 #[tauri::command]
-pub async fn leave_huddle(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn leave_huddle(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let (parent_channel_id, ephemeral_channel_id) = {
         let mut hs = state.huddle()?;
         if hs.phase == HuddlePhase::Idle {
@@ -596,6 +635,7 @@ pub async fn leave_huddle(state: State<'_, AppState>) -> Result<(), String> {
     }
 
     teardown_huddle(&state)?;
+    close_huddle_window(&app, &ephemeral_channel_id);
 
     Ok(())
 }
@@ -608,7 +648,11 @@ pub async fn leave_huddle(state: State<'_, AppState>) -> Result<(), String> {
 /// 3. Shut down the STT pipeline (Fix 5).
 /// 4. Clear local huddle state.
 #[tauri::command]
-pub async fn end_huddle(force: Option<bool>, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn end_huddle(
+    force: Option<bool>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let (parent_channel_id, ephemeral_channel_id) = {
         let mut hs = state.huddle()?;
         if hs.phase == HuddlePhase::Idle {
@@ -631,6 +675,7 @@ pub async fn end_huddle(force: Option<bool>, state: State<'_, AppState>) -> Resu
     emit_end_and_archive(&parent_channel_id, &ephemeral_channel_id, &state).await;
 
     teardown_huddle(&state)?;
+    close_huddle_window(&app, &ephemeral_channel_id);
 
     Ok(())
 }
@@ -745,91 +790,130 @@ pub fn get_model_status(_state: State<'_, AppState>) -> Result<models::VoiceMode
     })
 }
 
-/// Enable or disable TTS output.
-///
-/// When disabled, the TTS pipeline is shut down and audio output stops.
-/// When re-enabled, the pipeline is restarted if TTS models are available.
-///
-/// Takes the pipeline handle out of the lock before calling shutdown() — the
-/// thread join in Drop can block for ~200 ms (ONNX inference) and we don't
-/// want to hold the HuddleState mutex during that time.
-#[tauri::command]
-pub async fn set_tts_enabled(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
-    let old_pipeline = {
-        let mut hs = state.huddle()?;
-        hs.tts_enabled = enabled;
-        if !enabled {
-            hs.tts_pipeline.take() // Take out of lock.
-        } else {
-            None
-        }
-    };
-    // Shut down outside the lock — thread join happens here.
-    if let Some(ref pipeline) = old_pipeline {
-        pipeline.shutdown();
-    }
-    drop(old_pipeline);
-
-    if enabled {
-        // Re-start TTS pipeline if models are available and huddle is active.
-        let phase = {
-            let hs = state.huddle()?;
-            hs.phase.clone()
-        };
-        if matches!(phase, HuddlePhase::Connected | HuddlePhase::Active) {
-            if let Err(e) = maybe_start_tts_pipeline(&state).await {
-                eprintln!("buzz-desktop: TTS pipeline restart failed: {e}");
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Speak an agent message via TTS.
 ///
-/// Maximum text length accepted for TTS synthesis.
-/// ~2000 chars ≈ 1–2 minutes of speech. Longer messages are truncated.
-const MAX_TTS_TEXT_LEN: usize = 2000;
-
-/// Called by the WebView when it receives an incoming agent kind:9 message.
+/// Called by the WebView when it receives an eligible live agent message.
 /// Lazily starts the TTS pipeline if models are ready but the pipeline hasn't
 /// been created yet (e.g. models finished downloading after huddle started).
 ///
-/// No-op if TTS is disabled or models aren't ready.
+/// Disabled is the only intentional no-op. Enabled-but-unavailable speech
+/// returns an error so the caller cannot mistake a dropped message for success.
 #[tauri::command]
-pub async fn speak_agent_message(text: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn speak_agent_message(
+    text: String,
+    route_id: u64,
+    speaker_pubkey: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    eprintln!("buzz-desktop: tts stage=invoke status=started route_id={route_id}");
     // Truncate oversized messages — agents shouldn't monologue in a voice huddle.
     // Use char count (not byte length) to avoid panicking on multi-byte UTF-8.
-    let text = if text.chars().count() > MAX_TTS_TEXT_LEN {
-        let mut truncated: String = text.chars().take(MAX_TTS_TEXT_LEN).collect();
-        truncated.push_str("... message truncated.");
-        truncated
-    } else {
-        text
+    let text = normalize_agent_tts_text(text);
+
+    if !state.huddle()?.tts_enabled {
+        eprintln!(
+            "buzz-desktop: tts stage=invoke status=no_op reason=disabled route_id={route_id}"
+        );
+        return Ok(());
+    }
+
+    let Some(voice_reference) =
+        agent_voice::voice_reference_for_agent(&app, &state, &speaker_pubkey)?
+    else {
+        eprintln!(
+            "buzz-desktop: tts stage=invoke status=no_op reason=agent_disabled route_id={route_id}"
+        );
+        return Ok(());
     };
 
     let needs_pipeline = {
-        let hs = state.huddle()?;
-        hs.tts_enabled
-            && hs.tts_pipeline.is_none()
-            && matches!(hs.phase, HuddlePhase::Connected | HuddlePhase::Active)
+        let mut hs = state.huddle()?;
+        if hs
+            .tts_pipeline
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.is_finished())
+        {
+            hs.tts_pipeline = None;
+        }
+        match classify_agent_tts_runtime(hs.tts_enabled, &hs.phase, hs.tts_pipeline.is_some()) {
+            AgentTtsRuntimeGate::Disabled => {
+                eprintln!(
+                    "buzz-desktop: tts stage=invoke status=no_op reason=disabled route_id={route_id}"
+                );
+                return Ok(());
+            }
+            AgentTtsRuntimeGate::Inactive => {
+                eprintln!(
+                    "buzz-desktop: tts stage=invoke status=failed reason=inactive_huddle route_id={route_id}"
+                );
+                return Err(
+                    "Agent text to speech is unavailable outside an active huddle".to_string(),
+                );
+            }
+            AgentTtsRuntimeGate::NeedsPipeline => true,
+            AgentTtsRuntimeGate::Ready => false,
+        }
     };
 
     // Lazy-start: models may have finished downloading after the huddle began.
     if needs_pipeline {
-        if let Err(e) = maybe_start_tts_pipeline(&state).await {
-            eprintln!("buzz-desktop: TTS lazy-start failed: {e}");
-        }
+        maybe_start_tts_pipeline(&state).await.inspect_err(|_| {
+            eprintln!(
+                "buzz-desktop: tts stage=invoke status=failed reason=startup_failed route_id={route_id}"
+            );
+        })?;
+        await_inflight_tts_start(&state).await.inspect_err(|_| {
+            eprintln!(
+                "buzz-desktop: tts stage=invoke status=failed reason=startup_timeout route_id={route_id}"
+            );
+        })?;
     }
 
-    let hs = state.huddle()?;
-    if hs.tts_enabled {
-        if let Some(ref pipeline) = hs.tts_pipeline {
-            pipeline.speak(text)?;
+    let sender = {
+        let hs = state.huddle()?;
+        let agent_is_present = hs
+            .agent_pubkeys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|pubkey| pubkey.eq_ignore_ascii_case(&speaker_pubkey));
+        if !agent_is_present {
+            eprintln!(
+                "buzz-desktop: tts stage=queue status=dropped reason=speaker_removed route_id={route_id}"
+            );
+            return Ok(());
         }
-    }
-    Ok(())
+        hs.tts_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.text_sender())
+            .map(|sender| {
+                let speaker_generation = sender.speaker_generation(&speaker_pubkey);
+                (sender, speaker_generation)
+            })
+    };
+    let Some((sender, speaker_generation)) = sender else {
+        eprintln!(
+            "buzz-desktop: tts stage=invoke status=failed reason=unavailable route_id={route_id}"
+        );
+        return Err("Agent text to speech is enabled but its audio pipeline is unavailable".into());
+    };
+    enqueue_agent_tts_text(route_id, text, move |route_id, text| {
+        sender
+            .send(
+                route_id,
+                speaker_pubkey,
+                speaker_generation,
+                voice_reference,
+                text,
+            )
+            .map_err(|error| format!("TTS queue closed while waiting to enqueue: {error}"))
+    })
+    .await
+    .inspect(|_| eprintln!("buzz-desktop: tts stage=queue status=accepted route_id={route_id}"))
+    .inspect_err(|_| {
+        eprintln!("buzz-desktop: tts stage=queue status=failed reason=closed route_id={route_id}")
+    })
 }
 
 /// Add an agent to the active huddle.

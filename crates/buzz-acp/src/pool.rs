@@ -31,7 +31,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, model_in_catalog,
-    resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
+    resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer, ModelSwitchMethod,
+    StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -224,6 +225,13 @@ pub struct OwnedAgent {
     pub protocol_version: u32,
 }
 
+/// Package name reported by `claude-agent-acp` in its `initialize` response.
+/// Any adapter reporting this name supports `_meta.systemPrompt: {append: ...}`
+/// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
+/// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
+/// rename, so the new name is a reliable capability gate.
+const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
+
 fn has_system_prompt_support(
     protocol_version: u32,
     agent_name: &str,
@@ -231,20 +239,25 @@ fn has_system_prompt_support(
 ) -> bool {
     if agent_name == "goose" {
         goose_system_prompt_supported == Some(true)
+    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
+        true
     } else {
         protocol_version >= 2
     }
 }
 
-fn session_new_system_prompt(
+fn session_new_system_prompt<'a>(
     is_goose: bool,
     protocol_version: u32,
-    prompt: Option<&str>,
-) -> Option<&str> {
-    if is_goose || protocol_version < 2 {
+    agent_name: &str,
+    prompt: Option<&'a str>,
+) -> Option<SystemPromptTransport<'a>> {
+    if is_goose || (protocol_version < 2 && agent_name != CLAUDE_AGENT_ACP_NAME) {
         None
+    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
+        prompt.map(SystemPromptTransport::ClaudeMeta)
     } else {
-        prompt
+        prompt.map(SystemPromptTransport::Field)
     }
 }
 
@@ -1118,13 +1131,32 @@ const UNKNOWN_CHANNEL_NAME: &str = "unknown";
 async fn resolve_new_session_channel_context(
     channel_info: &ChannelInfoResolver,
     channel_id: Uuid,
-) -> (bool, Option<String>) {
+) -> (bool, Option<String>, Option<String>) {
     let Some(info) = channel_info.resolve(channel_id).await else {
-        return (true, None);
+        return (true, None, None);
     };
     let is_dm = info.channel_type == "dm";
     let title_channel = (!is_dm && info.name != UNKNOWN_CHANNEL_NAME).then_some(info.name);
-    (is_dm, title_channel)
+    (is_dm, title_channel, Some(info.channel_type))
+}
+
+/// What a brand-new ACP session is seeded with, beyond the agent and its
+/// `PromptContext`: the memory blocks to frame into the system prompt and the
+/// channel the session belongs to.
+///
+/// Grouped rather than passed loose so the heartbeat path can say "no channel,
+/// no memory" as `SessionSeed::default()` instead of five bare `None`s.
+#[derive(Default)]
+struct SessionSeed<'a> {
+    /// `[Agent Memory — core]` block, when the agent has one.
+    agent_core: Option<&'a str>,
+    /// `[Channel Canvas]` block for the originating channel.
+    agent_canvas: Option<&'a str>,
+    /// Channel name for the session title — `None` for DMs, unresolved and
+    /// unnamed channels, which then get an unqualified title.
+    channel_name: Option<&'a str>,
+    channel_id: Option<Uuid>,
+    channel_type: Option<&'a str>,
 }
 
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
@@ -1136,9 +1168,7 @@ async fn resolve_new_session_channel_context(
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
-    agent_core: Option<&str>,
-    agent_canvas: Option<&str>,
-    channel_name: Option<&str>,
+    seed: SessionSeed<'_>,
     session_mcp_servers: Vec<McpServer>,
 ) -> Result<String, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
@@ -1154,22 +1184,26 @@ async fn create_session_and_apply_model(
                 framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
                 ctx.team_instructions.as_deref(),
             ),
-            agent_core,
+            seed.agent_core,
         ),
-        agent_canvas,
+        seed.agent_canvas,
     );
 
     let session_title = ctx
         .session_title
         .as_deref()
-        .map(|agent_name| compose_session_title(agent_name, channel_name));
-
-    let mcp_servers = ctx
-        .mcp_servers
-        .iter()
-        .cloned()
-        .chain(session_mcp_servers)
-        .collect();
+        .map(|agent_name| compose_session_title(agent_name, seed.channel_name));
+    // Git-origin env goes on the configured servers only; the per-session
+    // browser server is addressed by its own activity id, not by git origin.
+    let mcp_servers: Vec<McpServer> = mcp_servers_with_git_origin(
+        &ctx.mcp_servers,
+        seed.channel_id,
+        seed.channel_type,
+        ctx.session_title.as_deref(),
+    )
+    .into_iter()
+    .chain(session_mcp_servers)
+    .collect();
     let resp = agent
         .acp
         .session_new_full(
@@ -1178,6 +1212,7 @@ async fn create_session_and_apply_model(
             session_new_system_prompt(
                 is_goose,
                 agent.protocol_version,
+                &agent.agent_name,
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
@@ -1266,7 +1301,7 @@ async fn create_session_and_apply_model(
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness auto-approves via handle_permission_request.
+    // are safely skipped — the harness rejects interactive permission requests.
     if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
@@ -1274,6 +1309,34 @@ async fn create_session_and_apply_model(
     }
 
     Ok(resp.session_id)
+}
+
+fn mcp_servers_with_git_origin(
+    servers: &[McpServer],
+    channel_id: Option<Uuid>,
+    channel_type: Option<&str>,
+    agent_name: Option<&str>,
+) -> Vec<McpServer> {
+    let mut servers = servers.to_vec();
+    let origin = match (channel_id, channel_type) {
+        (Some(channel_id), Some("stream")) => Some(EnvVar {
+            name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
+            value: channel_id.to_string(),
+        }),
+        (Some(_), _) => agent_name
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| EnvVar {
+                name: "BUZZ_GIT_ORIGIN_AGENT_NAME".into(),
+                value: name.trim().to_string(),
+            }),
+        (None, _) => None,
+    };
+    if let Some(origin) = origin {
+        for server in &mut servers {
+            server.env.push(origin.clone());
+        }
+    }
+    servers
 }
 
 /// Send the appropriate ACP model-switch request with a timeout.
@@ -1351,11 +1414,7 @@ async fn apply_model_switch(
     Ok(())
 }
 
-/// Set the session permission mode via `session/set_config_option`.
-///
-/// Non-fatal for most errors: logs and proceeds. The agent falls back
-/// to its default permission mode (`"default"`), which still works via
-/// Check if the agent's `session/new` response advertises a given mode ID
+/// Check whether the agent's `session/new` response advertises a given mode ID
 /// in `result.modes.availableModes[].id`. Returns `false` if the modes
 /// field is absent or the mode isn't listed.
 fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) -> bool {
@@ -1371,7 +1430,11 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
         .unwrap_or(false)
 }
 
-/// per-tool auto-approval in `handle_permission_request`.
+/// Set the session permission mode via `session/set_config_option`.
+///
+/// Non-fatal for most errors: logs and proceeds. The agent falls back to its
+/// default mode, and any interactive permission request is rejected by
+/// `handle_permission_request`.
 ///
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
 /// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
@@ -1411,7 +1474,7 @@ async fn apply_permission_mode(
         Ok(Err(e)) => {
             tracing::warn!(
                 target: "pool::permission",
-                "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
+                "failed to set permission mode {wire:?}: {e} — falling back to per-tool rejection"
             );
         }
         Err(_) => {
@@ -1777,14 +1840,15 @@ pub async fn run_prompt_task(
     // Channel name for the session title, from the same single resolve the
     // canvas DM check uses — see `resolve_new_session_channel_context`.
     let mut title_channel: Option<String> = None;
+    let mut origin_channel_type: Option<String> = None;
     if let PromptSource::Channel(cid) = &source {
         let is_new_channel_session = !agent.state.sessions.contains_key(cid);
         let needs_canvas = is_new_channel_session && !agent.state.canvas_sections.contains_key(cid);
-        let needs_title = is_new_channel_session && ctx.session_title.is_some();
-        if needs_canvas || needs_title {
-            let (is_dm, resolved_channel) =
+        if is_new_channel_session {
+            let (is_dm, resolved_channel, resolved_channel_type) =
                 resolve_new_session_channel_context(&ctx.channel_info, *cid).await;
             title_channel = resolved_channel;
+            origin_channel_type = resolved_channel_type;
             // A confirmed DM never receives a canvas section; an undeterminable
             // channel type fails closed as a DM for the same reason.
             if needs_canvas && !is_dm {
@@ -1859,9 +1923,13 @@ pub async fn run_prompt_task(
                         create_session_and_apply_model(
                             &mut agent,
                             &ctx,
-                            agent_core.as_deref(),
-                            agent_canvas.as_deref(),
-                            title_channel.as_deref(),
+                            SessionSeed {
+                                agent_core: agent_core.as_deref(),
+                                agent_canvas: agent_canvas.as_deref(),
+                                channel_name: title_channel.as_deref(),
+                                channel_id: Some(*cid),
+                                channel_type: origin_channel_type.as_deref(),
+                            },
                             browser_servers,
                         )
                         .await
@@ -1913,8 +1981,13 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None, None, vec![])
-                    .await
+                match create_session_and_apply_model(
+                    &mut agent,
+                    &ctx,
+                    SessionSeed::default(),
+                    vec![],
+                )
+                .await
                 {
                     Ok(sid) => {
                         tracing::info!(
@@ -3942,7 +4015,11 @@ pub(crate) fn build_turn_metric_counts(
             // from input+output.
             total_tokens: usage.turn_total_tokens,
             cost_usd: usage.turn_cost_usd,
-            cache_read_tokens: None,
+            // Field-local: present when the cumulative counter was monotonic
+            // across this turn. Zero means no cache hits this turn (not absent).
+            cache_read_tokens: usage.turn_cache_read_tokens,
+            // buzz-agent does not emit a cache-write count on the wire today;
+            // leave None rather than deriving it from other fields.
             cache_write_tokens: None,
         })
     } else {
@@ -3960,7 +4037,13 @@ pub(crate) fn build_turn_metric_counts(
         // one. Never derived from input+output (NIP-AM MUST NOT).
         total_tokens: usage.cumulative_total_tokens,
         cost_usd: usage.cumulative_cost_usd,
-        cache_read_tokens: None,
+        // Session-cumulative cache-read tokens; None when the harness never
+        // reported this field (e.g. goose or older buzz-agent sessions).
+        // Passes through directly — do not wrap in Some() as the field already
+        // carries provenance (None vs Some(0) are distinct meanings).
+        cache_read_tokens: usage.cumulative_cache_read_tokens,
+        // buzz-agent does not emit a cache-write count on the wire today;
+        // leave None rather than deriving it from other fields.
         cache_write_tokens: None,
     });
     (turn_counts, cumulative_counts)
@@ -4283,6 +4366,50 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
 
+    fn test_mcp_server() -> McpServer {
+        McpServer {
+            name: "dev".into(),
+            command: "buzz-dev-mcp".into(),
+            args: vec![],
+            env: vec![],
+        }
+    }
+
+    #[test]
+    fn public_session_forwards_channel_origin_to_mcp() {
+        let channel_id = Uuid::new_v4();
+        let servers = mcp_servers_with_git_origin(
+            &[test_mcp_server()],
+            Some(channel_id),
+            Some("stream"),
+            None,
+        );
+        assert!(servers[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
+        }));
+        assert!(!servers[0]
+            .env
+            .iter()
+            .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME"));
+    }
+
+    #[test]
+    fn private_session_forwards_agent_name_without_channel_id() {
+        let servers = mcp_servers_with_git_origin(
+            &[test_mcp_server()],
+            Some(Uuid::new_v4()),
+            Some("dm"),
+            Some("Builder"),
+        );
+        assert!(servers[0].env.iter().any(|entry| {
+            entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
+        }));
+        assert!(!servers[0]
+            .env
+            .iter()
+            .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
+    }
+
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
     // a legacy agent WITH a base_prompt must get [Base] prepended to the user
     // message. This is the exact regression that shipped in the round-2 bug.
@@ -4311,18 +4438,48 @@ mod tests {
         assert!(has_system_prompt_support(2, "goose", Some(true)));
         assert!(has_system_prompt_support(1, "goose", Some(true)));
         assert!(has_system_prompt_support(2, "buzz-agent", None));
+        // Goose never receives system prompt via session/new (uses post-hoc method).
         assert_eq!(
-            session_new_system_prompt(true, 2, Some("instructions")),
+            session_new_system_prompt(true, 2, "goose", Some("instructions")),
             None
         );
+        // Protocol-v2 non-goose gets Field transport.
         assert_eq!(
-            session_new_system_prompt(false, 2, Some("instructions")),
-            Some("instructions")
+            session_new_system_prompt(false, 2, "buzz-agent", Some("instructions")),
+            Some(SystemPromptTransport::Field("instructions"))
         );
+        // Protocol-v1 non-goose, non-claude gets None (legacy user-message framing).
         assert_eq!(
-            session_new_system_prompt(false, 1, Some("instructions")),
+            session_new_system_prompt(false, 1, "codex", Some("instructions")),
             None
         );
+        // claude-agent-acp gets ClaudeMeta transport regardless of protocol version.
+        assert_eq!(
+            session_new_system_prompt(false, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+            Some(SystemPromptTransport::ClaudeMeta("instructions"))
+        );
+        assert_eq!(
+            session_new_system_prompt(true, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+            None,
+            "goose path must never produce a transport even when agent_name matches"
+        );
+    }
+
+    #[test]
+    fn claude_agent_acp_has_system_prompt_support_regardless_of_protocol_version() {
+        // claude-agent-acp declares protocolVersion:1 but supports _meta.systemPrompt;
+        // has_system_prompt_support must return true so user-message framing is suppressed.
+        assert!(has_system_prompt_support(1, CLAUDE_AGENT_ACP_NAME, None));
+        assert!(has_system_prompt_support(2, CLAUDE_AGENT_ACP_NAME, None));
+    }
+
+    #[test]
+    fn old_zed_adapter_name_falls_through_to_protocol_version_gate() {
+        // The renamed @zed-industries package predates the _meta.systemPrompt support,
+        // so it must not be treated as capable and stays on legacy user-message framing.
+        let old_name = "@zed-industries/claude-code-acp";
+        assert!(!has_system_prompt_support(1, old_name, None));
+        assert!(has_system_prompt_support(2, old_name, None));
     }
 
     #[test]
@@ -6532,10 +6689,12 @@ mod tests {
             turn_output_tokens: Some(50),
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_read_tokens: None,
             cumulative_input_tokens: 100,
             cumulative_output_tokens: 50,
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            cumulative_cache_read_tokens: None,
             model: None,
         };
         // owner_pubkey = None → early return, no panic.
@@ -6566,10 +6725,12 @@ mod tests {
             turn_output_tokens: Some(80),
             turn_total_tokens: None,
             turn_cost_usd: Some(0.001),
+            turn_cache_read_tokens: None,
             cumulative_input_tokens: 200,
             cumulative_output_tokens: 80,
             cumulative_total_tokens: None,
             cumulative_cost_usd: Some(0.001),
+            cumulative_cache_read_tokens: None,
             model: None,
         };
         // Will try to publish and fail (no real relay) but must not panic.
@@ -6601,10 +6762,12 @@ mod tests {
             turn_output_tokens: Some(20),
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_read_tokens: None,
             cumulative_input_tokens: 150,
             cumulative_output_tokens: 70,
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            cumulative_cache_read_tokens: None,
             model: None,
         };
         // Must not panic; HTTP submit will fail (no real relay) — that's fine.
@@ -6636,10 +6799,12 @@ mod tests {
             turn_output_tokens: None,
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_read_tokens: None,
             cumulative_input_tokens: 400,
             cumulative_output_tokens: 100,
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            cumulative_cache_read_tokens: None,
             model: None,
         };
         // Will try to publish (encrypt succeeds) and fail HTTP (no relay) — must not panic.
@@ -6668,10 +6833,12 @@ mod tests {
             turn_output_tokens: Some(30),
             turn_total_tokens: Some(130), // genuine per-turn total
             turn_cost_usd: None,
+            turn_cache_read_tokens: None,
             cumulative_input_tokens: 500,
             cumulative_output_tokens: 120,
             cumulative_total_tokens: Some(620), // genuine cumulative total
             cumulative_cost_usd: None,
+            cumulative_cache_read_tokens: None,
             model: None,
         };
 
@@ -6715,10 +6882,12 @@ mod tests {
             turn_output_tokens: Some(60),
             turn_total_tokens: None, // provider did not supply a total
             turn_cost_usd: None,
+            turn_cache_read_tokens: None,
             cumulative_input_tokens: 200,
             cumulative_output_tokens: 60,
             cumulative_total_tokens: None, // session has no total
             cumulative_cost_usd: None,
+            cumulative_cache_read_tokens: None,
             model: None,
         };
 
@@ -6755,6 +6924,96 @@ mod tests {
         assert_ne!(
             turn_json["totalTokens"], derived_sum,
             "total_tokens must never equal input+output when provider omitted it"
+        );
+    }
+
+    /// A payload with nonzero `accumulatedCachedInputTokens` on the second turn
+    /// must produce a kind:44200 payload where `cumulative.cacheReadTokens` is
+    /// nonzero and `turn.cacheReadTokens` reflects the per-turn delta.
+    /// This is the acceptance-criterion test: it proves the threading is live,
+    /// not hardcoded to None.
+    #[test]
+    fn test_build_turn_metric_counts_cache_read_tokens_thread_through() {
+        // Wire-parse a buzz-agent payload with cache, run it through the tracker,
+        // and verify the published TokenCounts carry the cache field.
+        let raw1 = serde_json::json!({
+            "sessionId": "cache-sess",
+            "update": {
+                "sessionUpdate": "usage_update",
+                "accumulatedInputTokens": 15_091,
+                "accumulatedOutputTokens": 156,
+                "accumulatedCachedInputTokens": 5_033,
+            }
+        });
+        let raw2 = serde_json::json!({
+            "sessionId": "cache-sess",
+            "update": {
+                "sessionUpdate": "usage_update",
+                "accumulatedInputTokens": 28_500,
+                "accumulatedOutputTokens": 310,
+                "accumulatedCachedInputTokens": 11_000,
+            }
+        });
+
+        let mut tracker = crate::usage::UsageTracker::default();
+
+        // Turn 1 — establish baseline (delta unreliable, but cumulative still present).
+        tracker.begin_turn("cache-sess");
+        if let crate::usage::GooseSessionUpdateVariant::UsageUpdate(p) =
+            serde_json::from_value::<crate::usage::GooseSessionUpdateNotification>(raw1)
+                .unwrap()
+                .update
+        {
+            tracker.record("cache-sess", &p);
+        }
+        let t1 = tracker.take().expect("turn 1");
+
+        // Turn 1: cumulative must carry the cache count; turn delta is None (no baseline).
+        let (turn1, cum1) = crate::pool::build_turn_metric_counts(&t1);
+        // delta_reliable = false on first turn → no turn counts.
+        assert!(turn1.is_none(), "first turn: no reliable turn counts");
+        let cum1 = cum1.expect("cumulative always present");
+        assert_eq!(
+            cum1.cache_read_tokens,
+            Some(5_033),
+            "cumulative.cacheReadTokens must be 5033 after turn 1"
+        );
+
+        // Turn 2 — delta reliable.
+        tracker.begin_turn("cache-sess");
+        if let crate::usage::GooseSessionUpdateVariant::UsageUpdate(p) =
+            serde_json::from_value::<crate::usage::GooseSessionUpdateNotification>(raw2)
+                .unwrap()
+                .update
+        {
+            tracker.record("cache-sess", &p);
+        }
+        let t2 = tracker.take().expect("turn 2");
+
+        let (turn2, cum2) = crate::pool::build_turn_metric_counts(&t2);
+
+        let turn2 = turn2.expect("reliable turn counts on turn 2");
+        // Per-turn cache delta: 11_000 - 5_033 = 5_967.
+        assert_eq!(
+            turn2.cache_read_tokens,
+            Some(5_967),
+            "turn.cacheReadTokens must be the per-turn delta"
+        );
+        // cache_write_tokens is always None — buzz-agent doesn't emit it.
+        assert!(
+            turn2.cache_write_tokens.is_none(),
+            "cache_write_tokens must be None — not emitted by buzz-agent"
+        );
+
+        let cum2 = cum2.expect("cumulative always present");
+        assert_eq!(
+            cum2.cache_read_tokens,
+            Some(11_000),
+            "cumulative.cacheReadTokens must be 11_000 after turn 2"
+        );
+        assert!(
+            cum2.cache_write_tokens.is_none(),
+            "cache_write_tokens must be None on cumulative too"
         );
     }
 
@@ -7188,12 +7447,14 @@ mod tests {
         let response = channel_metadata_response(id, &[["name", "buzz-dev"], ["t", "stream"]]);
         let (resolver, requests, server) = counting_resolver(response).await;
 
-        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        let (is_dm, title_channel, channel_type) =
+            resolve_new_session_channel_context(&resolver, id).await;
         assert!(!is_dm, "a stream channel is not a DM");
         assert_eq!(title_channel.as_deref(), Some("buzz-dev"));
+        assert_eq!(channel_type.as_deref(), Some("stream"));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
 
-        let (_, again) = resolve_new_session_channel_context(&resolver, id).await;
+        let (_, again, _) = resolve_new_session_channel_context(&resolver, id).await;
         assert_eq!(again.as_deref(), Some("buzz-dev"));
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -7211,8 +7472,10 @@ mod tests {
         let response = channel_metadata_response(id, &[["name", "DM"], ["t", "dm"]]);
         let (resolver, _requests, server) = counting_resolver(response).await;
 
-        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        let (is_dm, title_channel, channel_type) =
+            resolve_new_session_channel_context(&resolver, id).await;
         assert!(is_dm);
+        assert_eq!(channel_type.as_deref(), Some("dm"));
         assert_eq!(
             title_channel, None,
             "a DM name must never reach the session title"
@@ -7229,7 +7492,7 @@ mod tests {
         let response = channel_metadata_response(id, &[["t", "stream"]]);
         let (resolver, _requests, server) = counting_resolver(response).await;
 
-        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        let (is_dm, title_channel, _) = resolve_new_session_channel_context(&resolver, id).await;
         assert!(!is_dm, "a nameless stream channel is still not a DM");
         assert_eq!(
             title_channel, None,
@@ -7249,10 +7512,11 @@ mod tests {
 
         let (resolver, requests, server) = counting_resolver(json!([])).await;
 
-        let (is_dm, title_channel) =
+        let (is_dm, title_channel, channel_type) =
             resolve_new_session_channel_context(&resolver, Uuid::new_v4()).await;
         assert!(is_dm, "an undeterminable channel type must fail closed");
         assert_eq!(title_channel, None, "unresolved channels get a bare title");
+        assert_eq!(channel_type, None);
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,

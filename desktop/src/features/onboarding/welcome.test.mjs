@@ -392,17 +392,45 @@ test("ensureOptionalWelcomeChannel reports unavailable on an owner-only relay", 
   assert.equal(result.unavailableReason, OWNER_ONLY_RELAY_ERROR);
 });
 
-test("ensureOptionalWelcomeChannel reports unavailable for a non-Error rejection", async () => {
+test("ensureOptionalWelcomeChannel reports unavailable when the relay blocks the creator", async () => {
+  const blocked = "relay returned 403 Forbidden: blocked: pubkey is banned";
   const result = await ensureOptionalWelcomeChannel({
-    getChannels: async () => {
-      throw "relay offline";
+    getChannels: async () => [],
+    createChannel: async () => {
+      throw new Error(blocked);
     },
-    createChannel: async () => makeChannel(),
   });
 
   assert.equal(result.channel, null);
-  assert.equal(typeof result.unavailableReason, "string");
-  assert.ok(result.unavailableReason.length > 0);
+  assert.equal(result.unavailableReason, blocked);
+});
+
+test("ensureOptionalWelcomeChannel rethrows a transient channel read failure", async () => {
+  // Only an authorization refusal means the community offers no Welcome
+  // channel. Swallowing a transient read failure marked it settled forever and
+  // let first run seed the channel cache from a relay it never reached, which
+  // in turn made the community-destination repair trust a stale channel list.
+  await assert.rejects(
+    ensureOptionalWelcomeChannel({
+      getChannels: async () => {
+        throw new Error("temporary channel read failure");
+      },
+      createChannel: async () => makeChannel(),
+    }),
+    /temporary channel read failure/,
+  );
+});
+
+test("ensureOptionalWelcomeChannel rethrows a non-Error rejection", async () => {
+  await assert.rejects(
+    ensureOptionalWelcomeChannel({
+      getChannels: async () => {
+        throw "relay offline";
+      },
+      createChannel: async () => makeChannel(),
+    }),
+    (error) => error === "relay offline",
+  );
 });
 
 test("resolveWelcomeFocusChannelId prefers the private Welcome channel", () => {

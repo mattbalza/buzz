@@ -30,13 +30,31 @@ export function relayAgentIsSharedWithUser(
   );
 }
 
+export function relayAgentCanRespondInChannel(
+  agent: Pick<RelayAgent, "channelIds" | "respondTo" | "respondToAllowlist">,
+  channelId: string,
+  currentPubkey?: string | null,
+) {
+  return (
+    agent.channelIds.includes(channelId) &&
+    relayAgentIsSharedWithUser(agent, new Set([channelId]), currentPubkey)
+  );
+}
+
+export type AgentEligibilityScope =
+  | { type: "community" }
+  | { type: "channel"; channelId: string }
+  | { type: "managed-only" };
+
 export function getMentionableAgentPubkeys({
   currentPubkey,
+  eligibilityScope,
   managedAgentPubkeys,
   relayAgents,
   sharedChannelIds,
 }: {
   currentPubkey?: string | null;
+  eligibilityScope: AgentEligibilityScope;
   managedAgentPubkeys: Iterable<string>;
   relayAgents: readonly RelayAgent[] | undefined;
   sharedChannelIds: ReadonlySet<string>;
@@ -46,7 +64,17 @@ export function getMentionableAgentPubkeys({
   );
 
   for (const agent of relayAgents ?? []) {
-    if (relayAgentIsSharedWithUser(agent, sharedChannelIds, currentPubkey)) {
+    const isAllowed =
+      eligibilityScope.type === "managed-only"
+        ? false
+        : eligibilityScope.type === "community"
+          ? relayAgentIsSharedWithUser(agent, sharedChannelIds, currentPubkey)
+          : relayAgentCanRespondInChannel(
+              agent,
+              eligibilityScope.channelId,
+              currentPubkey,
+            );
+    if (isAllowed) {
       pubkeys.add(normalizePubkey(agent.pubkey));
     }
   }
@@ -54,14 +82,13 @@ export function getMentionableAgentPubkeys({
   return pubkeys;
 }
 
-export function isAgentIdentityDiscoverable(
-  candidate: { isAgent?: boolean; isMember?: boolean; pubkey: string },
-  managedAgentPubkeys: ReadonlySet<string>,
+export function isAgentIdentityInAllowedList(
+  candidate: { isAgent?: boolean; pubkey: string },
+  allowedAgentPubkeys: ReadonlySet<string>,
 ) {
   return (
     candidate.isAgent !== true ||
-    candidate.isMember === true ||
-    managedAgentPubkeys.has(normalizePubkey(candidate.pubkey))
+    allowedAgentPubkeys.has(normalizePubkey(candidate.pubkey))
   );
 }
 
@@ -70,21 +97,86 @@ export function shouldHideAgentFromMentions({
   isMember,
   pubkey,
   mentionableAgentPubkeys,
+  directoryAgentPubkeys,
 }: {
   isAgent: boolean;
   isMember: boolean;
   pubkey: string;
   mentionableAgentPubkeys: ReadonlySet<string>;
+  directoryAgentPubkeys: ReadonlySet<string>;
 }) {
-  // Channel membership is sufficient for people and agents alike. Whether an
-  // agent is managed on this device only governs local lifecycle controls.
-  if (!isAgent || isMember) return false;
-  return !mentionableAgentPubkeys.has(normalizePubkey(pubkey));
+  if (!isAgent) return false;
+  const normalized = normalizePubkey(pubkey);
+  // Invocable => always show.
+  if (mentionableAgentPubkeys.has(normalized)) return false;
+  // Non-member, non-invocable => hide (preserves prior behavior).
+  if (!isMember) return true;
+  // Member (Option B): hide only when we have an explicit not-invocable
+  // signal — a relay directory (kind:10100) entry that excludes us.
+  // Unknown invocability (not in directory) => show.
+  //
+  // NOTE: this assumes `directoryAgentPubkeys` and `mentionableAgentPubkeys`
+  // share the same source query (`relayAgentsQuery.data`), so directory
+  // presence without membership in `mentionableAgentPubkeys` is a real
+  // explicit-exclusion signal. If a future change sources the directory set
+  // from a different query, an agent that's directory-present but whose
+  // mentionability is still loading could be hidden prematurely — keep the
+  // two sets derived from the same query.
+  return directoryAgentPubkeys.has(normalized);
+}
+
+export function isAgentMentionChannelType(type?: string | null) {
+  return type === "stream" || type === "forum";
+}
+
+export function uniqueAutocompleteLabels(
+  candidates: readonly AgentAutocompleteCandidate[],
+) {
+  const unique = new Map<string, string>();
+  for (const candidate of candidates) {
+    for (const label of [
+      candidate.displayName,
+      candidate.personaName,
+      candidate.secondaryLabel,
+    ]) {
+      const trimmed = label?.trim();
+      if (trimmed && !unique.has(trimmed.toLowerCase())) {
+        unique.set(trimmed.toLowerCase(), trimmed);
+      }
+    }
+  }
+  return [...unique.values()];
+}
+
+export function filterCachedAgentSuggestions<
+  T extends {
+    isAgent?: boolean;
+    pubkey?: string;
+  },
+>(
+  suggestions: readonly T[],
+  currentCandidates: readonly AgentAutocompleteCandidate[],
+) {
+  const admittedAgentPubkeys = new Set(
+    currentCandidates.flatMap((candidate) =>
+      candidate.isAgent && candidate.pubkey
+        ? [normalizePubkey(candidate.pubkey)]
+        : [],
+    ),
+  );
+  return suggestions.filter(
+    (suggestion) =>
+      !suggestion.isAgent ||
+      !suggestion.pubkey ||
+      admittedAgentPubkeys.has(normalizePubkey(suggestion.pubkey)),
+  );
 }
 
 type AgentAutocompleteCandidate = {
   pubkey?: string;
   displayName?: string | null;
+  personaName?: string | null;
+  secondaryLabel?: string | null;
   ownerPubkey?: string | null;
   isAgent?: boolean;
   isManagedAgent?: boolean;
