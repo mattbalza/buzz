@@ -869,8 +869,37 @@ jobs:
         run: cd mobile && flutter analyze
       - name: Test
         run: cd mobile && flutter test
+      # Without this, every APK build re-resolves the whole Android/Kotlin graph
+      # from Maven Central, which rate-limits us (run 31196146152 died on a 429 for
+      # kotlin-gradle-plugins-bom while resolving settings.gradle.kts). Flutter's own
+      # retry waits 100ms, so both attempts land inside the same 429 window.
+      #
+      # modules-2 only, not all of ~/.gradle/caches: modules-2 is the downloaded
+      # artifacts, which is the network dependency being fixed. The rest is derived
+      # (build-cache, transforms, jars) — caching it took the entry to 2.4 GB against
+      # a repo-wide 10 GB budget shared with the cargo, pnpm and Hermit caches, and
+      # would have evicted them to save CPU we are not short of.
+      # simplify: a cold cache still makes the round trip; add a retry if that recurs.
+      - name: Restore Gradle cache
+        id: gradle-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('mobile/android/**/*.gradle*', 'mobile/android/gradle.properties', 'mobile/android/gradle/wrapper/gradle-wrapper.properties', 'mobile/pubspec.lock') }}
+          restore-keys: gradle-${{ runner.os }}-
       - name: Build Android debug APK
         run: just mobile-build-android
+      - name: Save Gradle cache
+        if: always() && steps.gradle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('mobile/android/**/*.gradle*', 'mobile/android/gradle.properties', 'mobile/android/gradle/wrapper/gradle-wrapper.properties', 'mobile/pubspec.lock') }}
 
   security:
     name: Security
