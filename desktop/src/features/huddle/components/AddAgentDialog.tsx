@@ -222,7 +222,7 @@ export function AddAgentDialog({
                       {agent.name}
                     </span>
                     {agent.managed ? null : (
-                      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-2xs font-medium tracking-wide text-muted-foreground uppercase">
                         Team
                       </span>
                     )}
