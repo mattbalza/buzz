@@ -184,6 +184,65 @@ impl std::fmt::Display for PermissionMode {
     }
 }
 
+// ── FORK PATCH — delete when upstream PR #4938 lands ─────────────────────────
+//
+// Upstream `block/buzz` branch `duncan/permission-policy` (PR #4938, commits
+// 127298f1f, 6dbbc67f7, b3b1b3bea, 96538e9b1) introduces exactly this env var,
+// with these value names and this `reject` default. When an upstream ingest
+// carries it, DELETE `PermissionPolicy` and its `CliArgs`/`Config` fields here
+// and the matching block in `acp.rs` — do not merge around them.
+//
+// Why we carry it: `handle_permission_request` denies unconditionally, and our
+// four droplet bridges run unattended, so every tool call an adapter asks about
+// is refused with nobody awake to answer. @codex publishes its reply *through*
+// `mcp__buzz__buzz_send_message`, which makes a denied tool call an invisible
+// turn — the agents go silent rather than erroring. Our permission boundary is
+// the OS sandbox (bubblewrap, one UID per identity, `[permissions.*]` in each
+// `config.toml`, `network.enabled = false`, the broker socket), not an ACP
+// prompt no human is there to answer. The default below stays `reject`, so
+// upstream's posture is unchanged for anyone who does not opt in.
+
+/// How the harness answers an agent's `session/request_permission`.
+///
+/// Wire-compatible with upstream PR #4938's `BUZZ_ACP_PERMISSION_POLICY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum PermissionPolicy {
+    /// Select the request's unique `allow_once` option. Falls back to denial
+    /// when the request offers zero or several `allow_once` candidates.
+    Allow,
+    /// Upstream's attended behaviour — a human answers a prompt. There is no
+    /// prompt surface in a headless bridge, so this denies like `Reject` and
+    /// is accepted only so an upstream-shaped config never fails to parse.
+    Ask,
+    /// Fail closed: pick `reject_once`, or the protocol's cancelled outcome.
+    #[default]
+    Reject,
+}
+
+impl PermissionPolicy {
+    /// Stable lowercase name, matching the accepted CLI/env values.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Reject => "reject",
+        }
+    }
+
+    /// Whether this policy may select an `allow_once` option.
+    pub fn allows(&self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
+impl std::fmt::Display for PermissionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ── end fork patch ───────────────────────────────────────────────────────────
+
 /// CLI args for `buzz-acp models` — query available models from an agent.
 ///
 /// This is a standalone `Parser` (not a subcommand variant) because the
@@ -485,6 +544,20 @@ pub struct CliArgs {
     )]
     pub permission_mode: PermissionMode,
 
+    // FORK PATCH — delete when upstream PR #4938 lands. See `PermissionPolicy`.
+    /// How to answer an agent's `session/request_permission`.
+    ///
+    /// Defaults to `reject`, which is upstream's unconditional fail-closed
+    /// behaviour. Our unattended droplet bridges set `allow` in their unit
+    /// files; the OS sandbox, not this prompt, is their boundary.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_PERMISSION_POLICY",
+        default_value = "reject",
+        value_enum
+    )]
+    pub permission_policy: PermissionPolicy,
+
     /// Inbound author gate: which authors' events the harness forwards.
     /// Modes: owner-only (default), allowlist, anyone, nobody.
     #[arg(
@@ -585,6 +658,9 @@ pub struct Config {
     pub session_title: Option<String>,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
+    /// FORK PATCH — delete when upstream PR #4938 lands. How the harness
+    /// answers `session/request_permission`.
+    pub permission_policy: PermissionPolicy,
     /// Inbound author gate mode.
     pub respond_to: RespondTo,
     /// Additional author gate applied only to direct and group DMs.
@@ -1164,6 +1240,7 @@ impl Config {
                 .as_deref()
                 .and_then(sanitize_session_title),
             permission_mode: args.permission_mode,
+            permission_policy: args.permission_policy,
             respond_to: args.respond_to,
             dm_policy: args.dm_policy,
             respond_to_allowlist,
@@ -1177,6 +1254,12 @@ impl Config {
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
         };
+
+        // FORK PATCH — delete when upstream PR #4938 lands. Publish the policy
+        // to `acp::handle_permission_request`, which answers on the agent's I/O
+        // task and has no access to `Config`. Single write, at startup, before
+        // any agent is spawned.
+        crate::acp::install_permission_policy(config.permission_policy);
 
         Ok(config)
     }
@@ -1197,7 +1280,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} mcp_identity={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {} dm_policy={}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} mcp_identity={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} permission_policy={} {} dm_policy={}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1219,6 +1302,7 @@ impl Config {
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
+            self.permission_policy,
             respond_to_detail,
             self.dm_policy,
             allowed_respond_to_detail,
@@ -1539,6 +1623,7 @@ mod tests {
             model: None,
             session_title: None,
             permission_mode: PermissionMode::DontAsk,
+            permission_policy: PermissionPolicy::Reject,
             respond_to: RespondTo::Anyone,
             dm_policy: DmPolicy::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -2379,6 +2464,64 @@ channels = "ALL"
             "summary should show 'default', got: {s}"
         );
     }
+
+    // ── FORK PATCH tests — delete alongside the patch when PR #4938 lands ────
+    //
+    // The summary line is the only place the running policy is observable from
+    // outside the process, and `provision-buzz-isolation.sh verify` plus the
+    // post-deploy check both read it. A silent rename would take both with it.
+
+    #[test]
+    fn test_summary_includes_permission_policy() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        config.permission_policy = PermissionPolicy::Allow;
+        let s = config.summary();
+        assert!(
+            s.contains("permission_policy=allow"),
+            "summary should include permission_policy, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_summary_permission_policy_default_is_reject() {
+        let config = test_config(SubscribeMode::Mentions);
+        let s = config.summary();
+        assert!(
+            s.contains("permission_policy=reject"),
+            "an unconfigured bridge must summarise as fail-closed, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_permission_policy_value_enum_is_lowercase() {
+        use clap::ValueEnum;
+        for (policy, expected) in [
+            (PermissionPolicy::Allow, "allow"),
+            (PermissionPolicy::Ask, "ask"),
+            (PermissionPolicy::Reject, "reject"),
+        ] {
+            // Upstream PR #4938 accepts exactly these three spellings. A unit
+            // file carrying an upstream-shaped value must never fail to parse
+            // and take the bridge down with it.
+            assert_eq!(
+                policy.to_possible_value().unwrap().get_name(),
+                expected,
+                "BUZZ_ACP_PERMISSION_POLICY must accept {expected}"
+            );
+            assert_eq!(policy.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn test_only_allow_policy_permits_selection() {
+        assert!(PermissionPolicy::Allow.allows());
+        // `ask` has no prompt surface in a headless bridge, so it denies.
+        assert!(!PermissionPolicy::Ask.allows());
+        assert!(!PermissionPolicy::Reject.allows());
+        assert_eq!(PermissionPolicy::default(), PermissionPolicy::Reject);
+    }
+
+    // ── end fork patch tests ─────────────────────────────────────────────────
 
     #[test]
     fn test_default_config_rejects_interactive_permissions() {

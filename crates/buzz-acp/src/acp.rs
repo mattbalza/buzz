@@ -1871,12 +1871,15 @@ impl AcpClient {
         }
     }
 
-    /// Reject a `session/request_permission` request from the agent.
+    /// Answer a `session/request_permission` request from the agent.
     ///
-    /// Buzz has no human permission prompt in this harness, so selecting
-    /// `allow_once` would turn any admitted prompt into an implicit approval.
-    /// Find `reject_once` by kind when the adapter offers it; otherwise use the
-    /// protocol's cancelled outcome, which is also fail-closed.
+    /// Buzz has no human permission prompt in this harness, so by default
+    /// selecting `allow_once` would turn any admitted prompt into an implicit
+    /// approval. Find `reject_once` by kind when the adapter offers it;
+    /// otherwise use the protocol's cancelled outcome, which is also
+    /// fail-closed. A deployment whose boundary is its OS sandbox rather than
+    /// this prompt opts out with `BUZZ_ACP_PERMISSION_POLICY=allow` — see the
+    /// fork-patch block below and `config::PermissionPolicy`.
     ///
     /// The request `id` is stored as `serde_json::Value` to support both numeric
     /// and string IDs per JSON-RPC 2.0.
@@ -1896,13 +1899,17 @@ impl AcpClient {
             .as_array()
             .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
 
-        tracing::debug!(
+        // `info!`, not `debug!`: `RUST_LOG=buzz_acp=info` filters targets by
+        // prefix, so `acp::permission` needs its own directive to appear at all.
+        // A bridge whose every tool call is being answered here is either
+        // working or totally mute, and the journal must be able to say which.
+        tracing::info!(
             target: "acp::permission",
             "session/request_permission id={id}, {} options",
             options.len()
         );
 
-        let response = permission_denial_response(&id, options)?;
+        let response = permission_response(permission_policy_allows(), &id, options)?;
 
         // Write the response first, then mark as responded.
         //
@@ -2014,6 +2021,108 @@ fn permission_response_cancelled(id: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+// ── FORK PATCH — delete when upstream PR #4938 lands ─────────────────────────
+//
+// Upstream `block/buzz` branch `duncan/permission-policy` (PR #4938, commits
+// 127298f1f, 6dbbc67f7, b3b1b3bea, 96538e9b1) adds `BUZZ_ACP_PERMISSION_POLICY`
+// with the same values and the same `allow` semantics — select the request's
+// *unique* `allow_once` option, fail closed on anything else. When an upstream
+// ingest carries that PR, DELETE this block and the matching one in `config.rs`
+// rather than merging around them. See `config::PermissionPolicy` for why we
+// opt in: the boundary is the OS sandbox, not a prompt nobody answers.
+
+/// Process-wide permission policy, published once by `Config::from_args`.
+///
+/// Stored as a global because the answer is written on the agent's I/O task,
+/// which owns an `AcpClient` and never sees a `Config`. Encoded as a `u8` so
+/// the read on every permission request is a relaxed atomic load: `0` =
+/// `Reject` (the default before any config is parsed), `1` = `Allow`.
+static PERMISSION_POLICY_ALLOWS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the configured policy. Called once from `Config::from_args`, before
+/// any agent is spawned. Absent that call the policy is `reject`, so any code
+/// path that forgets to configure fails closed.
+pub fn install_permission_policy(policy: crate::config::PermissionPolicy) {
+    PERMISSION_POLICY_ALLOWS.store(policy.allows(), std::sync::atomic::Ordering::Relaxed);
+    if policy.allows() {
+        tracing::warn!(
+            target: "acp::permission",
+            "permission policy = allow — session/request_permission will select the unique \
+             allow_once option; the boundary for this bridge is its OS sandbox"
+        );
+    }
+}
+
+/// Read the published policy. `false` (reject) until `install_permission_policy`.
+fn permission_policy_allows() -> bool {
+    PERMISSION_POLICY_ALLOWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Answer a `session/request_permission` under the given policy.
+///
+/// `allow == false` is byte-for-byte today's behaviour. `allow == true` selects
+/// the request's `allow_once` option **only** when exactly one candidate exists
+/// with a string `optionId`; zero, several, or a malformed candidate fall
+/// through to [`permission_denial_response`]. Never `allow_always`, never a
+/// hardcoded `optionId`.
+fn permission_response(
+    allow: bool,
+    id: &serde_json::Value,
+    options: &[serde_json::Value],
+) -> Result<serde_json::Value, AcpError> {
+    if allow {
+        if let Some(response) = permission_allow_response(id, options) {
+            return Ok(response);
+        }
+    }
+    permission_denial_response(id, options)
+}
+
+/// Select the request's unique `allow_once` option, or `None` to fall through
+/// to denial.
+fn permission_allow_response(
+    id: &serde_json::Value,
+    options: &[serde_json::Value],
+) -> Option<serde_json::Value> {
+    let mut candidates = options
+        .iter()
+        .filter(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
+
+    let Some(first) = candidates.next() else {
+        tracing::warn!(
+            target: "acp::permission",
+            "policy=allow but permission request id={id} offers no allow_once option — denying"
+        );
+        return None;
+    };
+    if candidates.next().is_some() {
+        // Ambiguous: several allow_once options means we would be choosing on
+        // the agent's behalf between distinct grants. Fail closed.
+        tracing::warn!(
+            target: "acp::permission",
+            "policy=allow but permission request id={id} offers several allow_once options — denying"
+        );
+        return None;
+    }
+
+    let Some(option_id) = first.get("optionId").and_then(|v| v.as_str()) else {
+        tracing::warn!(
+            target: "acp::permission",
+            "policy=allow but the allow_once option of permission request id={id} has no string optionId — denying"
+        );
+        return None;
+    };
+
+    tracing::info!(
+        target: "acp::permission",
+        "allowing permission id={id} with allow_once optionId={option_id:?}"
+    );
+    Some(permission_response_selected(id, option_id))
+}
+
+// ── end fork patch ───────────────────────────────────────────────────────────
+
 /// Choose the fail-closed response to a `session/request_permission` request.
 ///
 /// Buzz has no human permission prompt in this harness, so selecting
@@ -2043,7 +2152,10 @@ fn permission_denial_response(
     let option_id = opt["optionId"]
         .as_str()
         .ok_or_else(|| AcpError::Protocol("reject_once option missing optionId".into()))?;
-    tracing::info!(
+    // `warn!`: a denied tool call is how an unattended bridge goes silently
+    // mute — the agent's turn still logs `turn complete`, so this line is the
+    // only evidence that anything went wrong.
+    tracing::warn!(
         target: "acp::permission",
         "rejecting permission id={id} with reject_once optionId={option_id:?}"
     );
@@ -2394,6 +2506,140 @@ mod tests {
             response["result"]["outcome"]["optionId"].as_str(),
             Some("rej-x")
         );
+    }
+
+    // ── FORK PATCH tests — delete alongside the patch when PR #4938 lands ────
+
+    /// The full option set an adapter offers. `allow` must pick `allow_once`
+    /// by kind — never `allow_always`, never a hardcoded id.
+    #[test]
+    fn allow_policy_selects_the_unique_allow_once() {
+        let options = options(
+            r#"[
+            {"optionId": "opt-reject-42",  "name": "Reject",       "kind": "reject_once"},
+            {"optionId": "opt-allow-99",   "name": "Allow once",   "kind": "allow_once"},
+            {"optionId": "opt-always-7",   "name": "Always allow", "kind": "allow_always"}
+        ]"#,
+        );
+
+        let response =
+            permission_response(true, &serde_json::json!(7), &options).expect("allow response");
+
+        assert_eq!(outcome(&response), Some("selected"));
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("opt-allow-99")
+        );
+    }
+
+    /// Several `allow_once` candidates means choosing between distinct grants
+    /// on the agent's behalf. Fail closed.
+    #[test]
+    fn allow_policy_denies_when_allow_once_is_ambiguous() {
+        let options = options(
+            r#"[
+            {"optionId": "opt-reject-42", "name": "Reject",     "kind": "reject_once"},
+            {"optionId": "opt-allow-1",   "name": "Allow once",  "kind": "allow_once"},
+            {"optionId": "opt-allow-2",   "name": "Allow once2", "kind": "allow_once"}
+        ]"#,
+        );
+
+        let response =
+            permission_response(true, &serde_json::json!(7), &options).expect("denial response");
+
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("opt-reject-42"),
+            "ambiguous allow_once must fall through to reject_once"
+        );
+    }
+
+    /// No options at all: `allow` must reach the same cancelled outcome as
+    /// `reject`, not an approval and not an error.
+    #[test]
+    fn allow_policy_with_no_options_is_cancelled() {
+        let response =
+            permission_response(true, &serde_json::json!(1), &[]).expect("cancelled response");
+
+        assert_eq!(outcome(&response), Some("cancelled"));
+    }
+
+    /// A malformed `allow_once` — no string `optionId` — is not a grant.
+    #[test]
+    fn allow_policy_denies_allow_once_without_string_option_id() {
+        let options = options(
+            r#"[
+            {"optionId": "opt-reject-42", "name": "Reject",     "kind": "reject_once"},
+            {"optionId": 5,               "name": "Allow once", "kind": "allow_once"}
+        ]"#,
+        );
+
+        let response =
+            permission_response(true, &serde_json::json!(1), &options).expect("denial response");
+
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("opt-reject-42")
+        );
+    }
+
+    /// `allow` must never reach for `allow_always`: a persistent grant is a
+    /// different decision from a single approved call.
+    #[test]
+    fn allow_policy_never_selects_allow_always() {
+        let options = options(
+            r#"[
+            {"optionId": "opt-reject-42", "name": "Reject",       "kind": "reject_once"},
+            {"optionId": "opt-always-7",  "name": "Always allow", "kind": "allow_always"}
+        ]"#,
+        );
+
+        let response =
+            permission_response(true, &serde_json::json!(1), &options).expect("denial response");
+
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("opt-reject-42")
+        );
+    }
+
+    /// The default policy must be byte-for-byte the pre-patch behaviour.
+    #[test]
+    fn reject_policy_is_identical_to_the_unconditional_denial() {
+        let options = options(
+            r#"[
+            {"optionId": "opt-reject-42",  "name": "Reject",       "kind": "reject_once"},
+            {"optionId": "opt-allow-99",   "name": "Allow once",   "kind": "allow_once"},
+            {"optionId": "opt-always-7",   "name": "Always allow", "kind": "allow_always"}
+        ]"#,
+        );
+
+        for id in [serde_json::json!(7), serde_json::json!("req-1")] {
+            assert_eq!(
+                permission_response(false, &id, &options).expect("denial response"),
+                permission_denial_response(&id, &options).expect("denial response"),
+            );
+        }
+
+        assert_eq!(
+            permission_response(false, &serde_json::json!(1), &[]).expect("cancelled"),
+            permission_denial_response(&serde_json::json!(1), &[]).expect("cancelled"),
+        );
+    }
+
+    /// `install_permission_policy` is the only writer, and `reject`/`ask` both
+    /// leave the reader fail-closed.
+    #[test]
+    fn only_allow_flips_the_published_policy() {
+        use crate::config::PermissionPolicy;
+
+        install_permission_policy(PermissionPolicy::Allow);
+        assert!(permission_policy_allows());
+
+        for denying in [PermissionPolicy::Reject, PermissionPolicy::Ask] {
+            install_permission_policy(denying);
+            assert!(!permission_policy_allows(), "{denying} must not allow");
+        }
     }
 
     #[test]
