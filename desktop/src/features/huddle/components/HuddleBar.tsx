@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import * as React from "react";
 
+import { useChannelsQuery } from "@/features/channels/hooks";
 import { useCustomEmoji } from "@/features/custom-emoji/hooks";
 import { EmojiPicker } from "@/features/custom-emoji/ui/EmojiPicker";
 import { useProfileQuery, useSelfProfileCache } from "@/features/profile/hooks";
@@ -27,6 +28,7 @@ import { useEmojiBurst } from "@/shared/ui/EmojiBurstProvider";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { useHuddle } from "../HuddleContext";
+import { huddleAllowsAgents } from "../lib/huddleAgentCandidates";
 import { AddAgentDialog, type AgentAddResult } from "./AddAgentDialog";
 import type { HuddleAgentVoiceSettings } from "./AgentVoiceMenu";
 import { MicControls, SpeakerControls } from "./MicControls";
@@ -366,6 +368,16 @@ export function HuddleBar({
   const barState = isHuddleVisible && state ? state : renderedState;
   const reactionChannelId = barState?.ephemeral_channel_id ?? null;
   const currentPubkey = identityQuery.data?.pubkey ?? null;
+  // `HuddleState` carries the parent channel's id but not its type, and the
+  // DM rule is a type rule — so resolve it from the channel list here.
+  const parentChannelId = barState?.parent_channel_id ?? null;
+  const channelsQuery = useChannelsQuery();
+  const canAddAgents = huddleAllowsAgents(
+    parentChannelId
+      ? (channelsQuery.data?.find((channel) => channel.id === parentChannelId)
+          ?.channelType ?? null)
+      : null,
+  );
   const participantSpeakerLevels = React.useMemo(() => {
     const levels = { ...speakerLevels };
     if (currentPubkey) {
@@ -619,6 +631,7 @@ export function HuddleBar({
 
         <AddAgentDialog
           currentAgentPubkeys={barState.agent_pubkeys}
+          parentChannelId={parentChannelId}
           onClose={() => setShowAddAgent(false)}
           onAdd={async (pubkey: string): Promise<AgentAddResult> => {
             setAgentAddError(null);
@@ -785,23 +798,28 @@ export function HuddleBar({
             </TooltipContent>
           </Tooltip>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                aria-label="Add agent to huddle"
-                className="buzz-huddle-control-button h-12 w-12 shrink-0 rounded-md"
-                onClick={() => setShowAddAgent(true)}
-                size="icon"
-                type="button"
-                variant="secondary"
-              >
-                <Bot className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent className="buzz-huddle-tooltip" side="top">
-              Add agent
-            </TooltipContent>
-          </Tooltip>
+          {/* A huddle started from a DM has no way to gain an agent: an agent
+              has to already be a member of the conversation, same as for DM
+              threads. */}
+          {canAddAgents ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label="Add agent to huddle"
+                  className="buzz-huddle-control-button h-12 w-12 shrink-0 rounded-md"
+                  onClick={() => setShowAddAgent(true)}
+                  size="icon"
+                  type="button"
+                  variant="secondary"
+                >
+                  <Bot className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent className="buzz-huddle-tooltip" side="top">
+                Add agent
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
         </div>
       </div>
 
