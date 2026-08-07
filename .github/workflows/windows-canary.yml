@@ -16,7 +16,10 @@ permissions:
 jobs:
   build:
     name: Build Windows canary
-    if: github.repository == 'block/buzz'
+    # Fork addition: mattbalza/buzz is how the Scalarly team gets a Windows
+    # installer at all. There is no signed Windows release for this fork, so
+    # this unsigned canary artifact *is* the shipping path — see BUZZ-SETUP.md.
+    if: contains(fromJSON('["block/buzz", "mattbalza/buzz"]'), github.repository)
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
