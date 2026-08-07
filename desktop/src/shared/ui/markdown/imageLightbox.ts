@@ -403,3 +403,34 @@ export function visibleImageGalleryForTrigger(
     galleryItems: galleryItems.length > 1 ? galleryItems : undefined,
   };
 }
+
+/**
+ * Everything inside `container` a Tab press can reach.
+ *
+ * The lightbox is a focus trap, so it needs the first and last of these to
+ * wrap the cycle. `disabled`, `aria-hidden` and zero client rects are all
+ * ways an element can match the selector while being unreachable — an
+ * offscreen thumbnail button, a control in a collapsed panel — and focusing
+ * one of those looks to the user like Tab did nothing.
+ */
+export function getImageLightboxFocusableElements(
+  container: HTMLElement,
+): HTMLElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(
+      [
+        "a[href]",
+        "button:not(:disabled)",
+        "input:not(:disabled)",
+        "select:not(:disabled)",
+        "textarea:not(:disabled)",
+        "[tabindex]:not([tabindex='-1'])",
+      ].join(","),
+    ),
+  ).filter(
+    (element) =>
+      !element.hasAttribute("disabled") &&
+      element.getAttribute("aria-hidden") !== "true" &&
+      element.getClientRects().length > 0,
+  );
+}
