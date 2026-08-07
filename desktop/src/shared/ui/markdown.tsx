@@ -28,6 +28,7 @@ import {
 } from "@/shared/lib/linkPreview";
 import { useResolvedLinkPreviews } from "@/shared/lib/useResolvedLinkPreviews";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useMediaAvailability } from "@/shared/lib/useMediaAvailability";
 import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { AttachmentGroup } from "@/shared/ui/attachment";
 import { ConfigNudgeCard } from "@/shared/ui/config-nudge-attachment";
@@ -101,6 +102,7 @@ import {
   imageLightboxBasisBoxForItem,
   imageLightboxBoxFromRect,
   imageLightboxCornerRadiiFromElement,
+  getImageLightboxFocusableElements,
   imageLightboxCornerRadiiStyle,
   imageLightboxExpandedCornerRadii,
   imageLightboxReturnTargetForItem,
@@ -113,6 +115,7 @@ import {
   visibleImageGalleryForTrigger,
 } from "./markdown/imageLightbox";
 import { MarkdownTable } from "./markdown/MarkdownTable";
+import { MediaExpiredCard } from "./markdown/MediaExpiredCard";
 import { ProgressiveImage } from "./markdown/ProgressiveImage";
 import { MessageLinkPill } from "./markdown/MessageLinkPill";
 import { renderCachedMarkdown } from "./markdown/nodeCache";
@@ -148,28 +151,6 @@ type ImageBlockProps = {
 type WebKitGestureLikeEvent = Event & {
   scale?: number;
 };
-
-function getImageLightboxFocusableElements(
-  container: HTMLElement,
-): HTMLElement[] {
-  return Array.from(
-    container.querySelectorAll<HTMLElement>(
-      [
-        "a[href]",
-        "button:not(:disabled)",
-        "input:not(:disabled)",
-        "select:not(:disabled)",
-        "textarea:not(:disabled)",
-        "[tabindex]:not([tabindex='-1'])",
-      ].join(","),
-    ),
-  ).filter(
-    (element) =>
-      !element.hasAttribute("disabled") &&
-      element.getAttribute("aria-hidden") !== "true" &&
-      element.getClientRects().length > 0,
-  );
-}
 
 function ImageZoomOverlay({
   alt,
@@ -1023,6 +1004,7 @@ function ImageBlock({ alt, dim, resolvedSrc, src, thumbSrc }: ImageBlockProps) {
   const triggerRef = React.useRef<HTMLButtonElement | null>(null);
   useSmoothCorners(inlineImageRef);
   useSmoothCorners(thumbnailImageRef);
+  const { availability, reportFailure } = useMediaAvailability(resolvedSrc);
 
   const [spoilerMediaSize, setSpoilerMediaSize] = React.useState<{
     height: number;
@@ -1188,6 +1170,12 @@ function ImageBlock({ alt, dim, resolvedSrc, src, thumbSrc }: ImageBlockProps) {
     [],
   );
 
+  // Past the retention window there is no image to zoom, copy or download, so
+  // the whole affordance goes: a lightbox trigger over nothing is a trap.
+  if (availability === "expired") {
+    return <MediaExpiredCard filename={alt?.trim() || undefined} />;
+  }
+
   return (
     <>
       <button
@@ -1213,6 +1201,7 @@ function ImageBlock({ alt, dim, resolvedSrc, src, thumbSrc }: ImageBlockProps) {
           alt={alt}
           fullImageRef={inlineImageRef}
           height={intrinsicDimensions.height}
+          onFullError={reportFailure}
           onFullLoad={handleImageLoad}
           onThumbnailLoad={updateSpoilerMediaSize}
           resolvedSrc={resolvedSrc}
