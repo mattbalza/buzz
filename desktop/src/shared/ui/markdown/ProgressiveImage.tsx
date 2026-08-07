@@ -24,6 +24,7 @@ type ProgressiveImageProps = {
   alt: string | undefined;
   fullImageRef: React.RefObject<HTMLImageElement | null>;
   height: number;
+  onFullError: () => void;
   onFullLoad: (image: HTMLImageElement) => void;
   onThumbnailLoad: (image: HTMLImageElement) => void;
   resolvedSrc: string | undefined;
@@ -38,6 +39,7 @@ export function ProgressiveImage({
   alt,
   fullImageRef,
   height,
+  onFullError,
   onFullLoad,
   onThumbnailLoad,
   resolvedSrc,
@@ -133,6 +135,8 @@ export function ProgressiveImage({
           src={resolvedSrc}
           style={style}
           width={width}
+          // The event carries no status, so the parent has to go and ask why.
+          onError={onFullError}
           onLoad={(event) => void handleFullLoad(event.currentTarget)}
         />
       ) : null}

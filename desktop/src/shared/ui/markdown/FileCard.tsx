@@ -3,7 +3,19 @@ import { Download, FileText } from "lucide-react";
 import { toast } from "sonner";
 
 import { invokeTauri } from "@/shared/api/tauri";
+import { classifyMediaErrorMessage } from "@/shared/lib/mediaAvailability";
+import { MediaExpiredCard } from "@/shared/ui/markdown/MediaExpiredCard";
 import { useSmoothCorners } from "@/shared/ui/smoothCorners";
+
+/**
+ * The text of a rejection, whichever shape it arrived in. Tauri rejects with
+ * the command's raw `String`, not an `Error`, so an `instanceof` check alone
+ * throws away the only description of what went wrong.
+ */
+function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return typeof err === "string" ? err : "";
+}
 
 /** Human-readable byte size: "820 B", "12.4 KB", "3.1 MB". */
 function formatFileSize(bytes: number): string {
@@ -41,6 +53,12 @@ export function FileCard({
   const cardRef = React.useRef<HTMLButtonElement | null>(null);
   const sizeLabel = size != null ? formatFileSize(size) : "";
   useSmoothCorners(cardRef);
+  const [expired, setExpired] = React.useState(false);
+
+  // Nothing here is worth a second press once the blob is past retention, and
+  // a download button that fails every time reads as a broken app rather than
+  // an old message.
+  if (expired) return <MediaExpiredCard filename={filename} />;
 
   return (
     <button
@@ -49,8 +67,14 @@ export function FileCard({
       onClick={() => {
         invokeTauri("download_file", { url: href, filename }).catch(
           (err: unknown) => {
-            const msg = err instanceof Error ? err.message : "Download failed";
-            toast.error(msg);
+            const msg = errorText(err);
+            // An expired file is not a failed download: the card says so and
+            // stays said, where a toast would be gone by the next press.
+            if (classifyMediaErrorMessage(msg) === "expired") {
+              setExpired(true);
+              return;
+            }
+            toast.error(msg || "Download failed");
           },
         );
       }}
