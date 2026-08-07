@@ -2,10 +2,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { LoaderCircle } from "lucide-react";
 import * as React from "react";
 
+import { useRelayAgentsQuery } from "@/features/agents/hooks";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import { Dialog } from "@/shared/ui/dialog";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import type { ManagedAgentBackend } from "@/shared/api/types";
+
+import {
+  buildHuddleAgentCandidates,
+  type HuddleAgentCandidate,
+} from "../lib/huddleAgentCandidates";
 
 type ManagedAgentSummary = {
   pubkey: string;
@@ -26,6 +33,12 @@ type AddAgentDialogProps = {
   onClose: () => void;
   onAdd: (pubkey: string) => Promise<AgentAddResult>;
   currentAgentPubkeys: string[];
+  /**
+   * The huddle's parent channel. Scopes which of the team's server-side agents
+   * (@erp, @codex, @claude, @seek) may be offered — exactly the set that could
+   * be @mentioned in that channel. `null` narrows the picker to managed agents.
+   */
+  parentChannelId: string | null;
 };
 
 export function AddAgentDialog({
@@ -33,17 +46,23 @@ export function AddAgentDialog({
   onClose,
   onAdd,
   currentAgentPubkeys,
+  parentChannelId,
 }: AddAgentDialogProps) {
-  const [agents, setAgents] = React.useState<ManagedAgentSummary[]>([]);
+  const [managedAgents, setManagedAgents] = React.useState<
+    ManagedAgentSummary[]
+  >([]);
   const [loading, setLoading] = React.useState(true);
   const [adding, setAdding] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [warning, setWarning] = React.useState<string | null>(null);
 
+  const identityQuery = useIdentityQuery();
+  const relayAgentsQuery = useRelayAgentsQuery({ enabled: open });
+
   React.useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    setAgents([]);
+    setManagedAgents([]);
     setLoading(true);
     setAdding(null);
     setError(null);
@@ -51,7 +70,7 @@ export function AddAgentDialog({
 
     invoke<ManagedAgentSummary[]>("list_managed_agents")
       .then((nextAgents) => {
-        if (!cancelled) setAgents(nextAgents);
+        if (!cancelled) setManagedAgents(nextAgents);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -67,30 +86,46 @@ export function AddAgentDialog({
     };
   }, [open]);
 
-  const availableAgents = agents.filter(
-    (agent) =>
-      !currentAgentPubkeys.some(
-        (pubkey) => pubkey.toLowerCase() === agent.pubkey.toLowerCase(),
-      ),
+  const availableAgents = React.useMemo(
+    () =>
+      buildHuddleAgentCandidates({
+        currentAgentPubkeys,
+        currentPubkey: identityQuery.data?.pubkey,
+        managedAgents,
+        parentChannelId,
+        relayAgents: relayAgentsQuery.data,
+      }),
+    [
+      currentAgentPubkeys,
+      identityQuery.data?.pubkey,
+      managedAgents,
+      parentChannelId,
+      relayAgentsQuery.data,
+    ],
   );
 
-  async function handleAdd(agent: ManagedAgentSummary) {
+  async function handleAdd(agent: HuddleAgentCandidate) {
     if (adding) return;
     setAdding(agent.pubkey);
     setError(null);
     setWarning(null);
     let startedForAdd = false;
     try {
-      const isLocal = agent.backend.type === "local";
-      const needsStart = isLocal
-        ? agent.status !== "running"
-        : agent.status !== "deployed";
-      if (needsStart && isLocal) {
+      // Remote agents run on the server under their own identity. Adding one is
+      // a membership event addressed to its pubkey; nothing here owns its
+      // process, so there is no start, no stop and no rollback to attempt.
+      const managed = agent.managed;
+      const needsStart = managed
+        ? managed.isLocal
+          ? managed.status !== "running"
+          : managed.status !== "deployed"
+        : false;
+      if (needsStart && managed?.isLocal) {
         await invoke("start_managed_agent", { pubkey: agent.pubkey });
         startedForAdd = true;
       }
       const result = await onAdd(agent.pubkey);
-      if (needsStart && !isLocal) {
+      if (needsStart && managed && !managed.isLocal) {
         try {
           await invoke("start_managed_agent", { pubkey: agent.pubkey });
         } catch (startError: unknown) {
@@ -173,18 +208,24 @@ export function AddAgentDialog({
                 <li key={agent.pubkey}>
                   <button
                     className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+                    data-agent-source={agent.managed ? "managed" : "remote"}
                     disabled={adding !== null}
                     onClick={() => void handleAdd(agent)}
                     type="button"
                   >
                     <ProfileAvatar
-                      avatarUrl={agent.avatar_url}
+                      avatarUrl={agent.avatarUrl}
                       className="h-9 w-9 shrink-0 text-xs"
                       label={agent.name}
                     />
                     <span className="min-w-0 flex-1 truncate text-sm font-medium">
                       {agent.name}
                     </span>
+                    {agent.managed ? null : (
+                      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                        Team
+                      </span>
+                    )}
                     {isAdding ? (
                       <LoaderCircle
                         aria-label={`Adding ${agent.name}`}
