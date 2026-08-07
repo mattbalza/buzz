@@ -606,6 +606,58 @@ test("selecting a person mention inserts @Name into input", async ({
   await expect(mentionChip).not.toHaveClass(/agent-mention-highlight/);
 });
 
+test("clicking past the end of a mention chip puts the caret outside the handle", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const input = page.getByTestId("message-input");
+  await input.fill("Hey @bo");
+  await autocomplete(page).getByText("bob").click();
+  await expect(input).toHaveText("Hey @bob ");
+  await page.keyboard.type("tail");
+  await expect(input).toHaveText("Hey @bob tail");
+
+  const chip = input.locator(".mention-chip", { hasText: "@bob" });
+  // The chip's painted box must not extend past its last glyph: any pixel that
+  // is visually after the name but still inside the chip is a caret trap, and
+  // a click there lands *before* the trailing space, inside the handle.
+  const geometry = await chip.evaluate((el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el.firstChild as Node);
+    const rects = range.getClientRects();
+    const box = el.getBoundingClientRect();
+    return {
+      band: box.right - rects[rects.length - 1].right,
+      glyphRight: rects[rects.length - 1].right,
+      y: box.y + box.height / 2,
+    };
+  });
+  expect(geometry.band).toBeLessThanOrEqual(0.5);
+
+  // Click two pixels past the last glyph — visually after the name, and inside
+  // the old padding band — then type: the keystroke must land after the
+  // mention, not weld itself onto the handle.
+  await page.mouse.click(geometry.glyphRight + 2, geometry.y);
+  const caretInChip = await page.evaluate(() => {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return true;
+    const node = selection.getRangeAt(0).startContainer;
+    const element =
+      node.nodeType === Node.ELEMENT_NODE
+        ? (node as HTMLElement)
+        : node.parentElement;
+    return !!element?.closest(".mention-chip");
+  });
+  expect(caretInChip).toBe(false);
+
+  await page.keyboard.type("Z");
+  await expect(input).not.toHaveText("Hey @bobZ tail");
+  await expect(chip).toHaveText("@bob");
+});
+
 test("selecting a managed agent mention inserts @Name into input", async ({
   page,
 }) => {
