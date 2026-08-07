@@ -5,6 +5,11 @@ import * as React from "react";
 
 import { buildCustomEmojiCategory } from "@/features/custom-emoji/emojiMartCategory";
 import { useCustomEmoji } from "@/features/custom-emoji/hooks";
+import {
+  useEmojiMartStyles,
+  useEmojiMartThemeVars,
+} from "@/features/profile/ui/ProfileAvatarEditor.utils";
+import { cn } from "@/shared/lib/cn";
 
 // emoji-mart builds its searchable index synchronously inside `init`, which
 // `<Picker>` calls on mount — so the first reaction popover open paid the full
@@ -103,12 +108,15 @@ function disableSearchInputCorrections(
 type EmojiPickerProps = {
   /** Autofocus the search field when the picker mounts (e.g. reaction popovers). */
   autoFocus?: boolean;
+  /** Override the panel's size or corners. The surface classes still apply. */
+  className?: string;
   /** Called with the chosen emoji as a string: `native` glyph or `:shortcode:`. */
   onSelect: (emoji: string) => void;
 };
 
 export const EmojiPicker = React.memo(function EmojiPicker({
   autoFocus = false,
+  className,
   onSelect,
 }: EmojiPickerProps) {
   const customEmoji = useCustomEmoji();
@@ -117,6 +125,20 @@ export const EmojiPicker = React.memo(function EmojiPicker({
     [customEmoji],
   );
   const hostRef = React.useRef<HTMLDivElement>(null);
+  // The panel. Without `--rgb-background`, emoji-mart falls back to its own
+  // `theme="auto"` palette, which follows `prefers-color-scheme` and not Buzz's
+  // theme class — a white panel on a white app, inside popovers that carry
+  // `bg-transparent border-0 shadow-none` because they assume the picker paints
+  // itself. And a wheel event over a shadow-root list is retargeted to the
+  // host, so `.scroll` needs the handler `useEmojiMartStyles` installs or the
+  // list never moves.
+  //
+  // Both live in `.buzz-emoji-mart` + `useEmojiMartThemeVars` +
+  // `useEmojiMartStyles`, and until now only ProfileAvatarEditor and
+  // AgentCreationPreview — which render emoji-mart directly — applied them. So
+  // the shared picker was the one without a panel, everywhere it was used.
+  const themeVars = useEmojiMartThemeVars();
+  useEmojiMartStyles(hostRef, true);
 
   React.useEffect(() => {
     if (!hostRef.current) return;
@@ -124,7 +146,14 @@ export const EmojiPicker = React.memo(function EmojiPicker({
   }, [autoFocus]);
 
   return (
-    <div ref={hostRef}>
+    <div
+      className={cn(
+        "buzz-emoji-mart relative z-0 h-[340px] overflow-hidden rounded-xl bg-muted",
+        className,
+      )}
+      ref={hostRef}
+      style={themeVars}
+    >
       <Picker
         autoFocus={autoFocus}
         custom={custom}
