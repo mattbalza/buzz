@@ -60,8 +60,11 @@ pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
     tag
 }
 
-/// MIME types accepted for upload.
-const ALLOWED_MIMES: &[&str] = &[
+/// Image and video MIME types, which the relay routes to its media pipelines
+/// (thumbnailing, metadata stripping, MP4 track validation). Any *other*
+/// `image/` or `video/` type is refused by those validators, so the CLI names
+/// the five canonical ones rather than accepting the prefixes.
+const MEDIA_MIMES: &[&str] = &[
     "image/jpeg",
     "image/png",
     "image/gif",
@@ -69,11 +72,68 @@ const ALLOWED_MIMES: &[&str] = &[
     "video/mp4",
 ];
 
-/// Maximum file size for image uploads (50 MB).
-const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+/// MIME types the relay refuses on the generic-file path, mirrored here so an
+/// obviously-doomed upload fails before the bytes go over the wire.
+///
+/// Kept byte-identical to `BLOCKED_FILE_MIME_TYPES` in
+/// `crates/buzz-media/src/validation.rs` and `BLOCKED_MIME` in the desktop app:
+/// active-content stored-XSS carriers, then native executables. This is a
+/// convenience copy, never the security boundary — the relay re-derives the
+/// type from magic bytes and enforces the same list on every upload.
+const BLOCKED_MIMES: &[&str] = &[
+    // Active web content — stored-XSS carriers.
+    "text/html",
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "application/javascript",
+    "text/javascript",
+    // Native executables / installers.
+    "application/x-msdownload",
+    "application/x-executable",
+    "application/vnd.microsoft.portable-executable",
+    "application/x-mach-binary",
+    "application/x-sharedlib",
+    "application/x-elf",
+    "application/x-msi",
+    "application/vnd.android.package-archive",
+    "application/x-apple-diskimage",
+];
 
-/// Maximum file size for video uploads (500 MB).
-const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
+/// Why the relay would refuse this MIME type, or `None` if it will take it.
+///
+/// The CLI used to carry an *allowlist* of five image/video types, which meant
+/// it refused every document, archive and text file the relay has accepted on
+/// its generic-file path since `validate_file_content` landed. That mattered
+/// beyond the CLI: the server agents upload through this code path, so a PDF an
+/// agent was asked to file came back as "unsupported file type" from a check
+/// that never consulted the relay. This mirrors the relay's policy instead —
+/// deny the known-dangerous, allow the rest.
+fn upload_rejection_reason(mime: &str) -> Option<String> {
+    if BLOCKED_MIMES.contains(&mime) {
+        return Some(format!("unsupported file type: {mime}"));
+    }
+    if MEDIA_MIMES.contains(&mime) {
+        return None;
+    }
+    // A non-canonical image/video type reaches the relay's media validators,
+    // which only understand the five above.
+    if mime.starts_with("image/") || mime.starts_with("video/") {
+        return Some(format!(
+            "unsupported file type: {mime} (the relay accepts {} as media)",
+            MEDIA_MIMES.join(", ")
+        ));
+    }
+    // Audio is refused deliberately upstream, not by oversight: containers such
+    // as MP3, M4A and FLAC carry tag blocks that can hold location and device
+    // data, and Buzz has no metadata-free validator for them the way it does
+    // for JPEG/PNG/WebP/GIF/MP4. Name the reason so it does not read as a bug.
+    if mime.starts_with("audio/") {
+        return Some(format!(
+            "unsupported file type: {mime} (audio has no metadata sanitizer yet)"
+        ));
+    }
+    None
+}
 
 /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
 ///
@@ -1113,23 +1173,16 @@ impl BuzzClient {
             .map(|t| t.mime_type().to_string())
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        if !ALLOWED_MIMES.contains(&mime.as_str()) {
-            return Err(CliError::Usage(format!("unsupported file type: {mime}")));
+        if let Some(reason) = upload_rejection_reason(&mime) {
+            return Err(CliError::Usage(reason));
         }
 
-        // 3. Size check
-        let max = if mime.starts_with("video/") {
-            MAX_VIDEO_BYTES
-        } else {
-            MAX_IMAGE_BYTES
-        };
-        if bytes.len() as u64 > max {
-            return Err(CliError::Usage(format!(
-                "file too large: {} bytes (max {})",
-                bytes.len(),
-                max
-            )));
-        }
+        // 3. No size check here. The CLI used to carry its own 50 MB / 500 MB
+        //    constants, which drifted from the relay's configured caps and
+        //    silently refused files the server would have taken. The relay
+        //    rejects an oversized body on Content-Length before reading it, so
+        //    deferring costs one round-trip of headers and keeps exactly one
+        //    place where the limit is defined.
 
         // 4. SHA-256
         let sha256 = hex::encode(Sha256::digest(&bytes));
@@ -2304,9 +2357,83 @@ mod retry_policy_tests {
 mod tests {
     use super::{
         advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
-        BuzzClient,
+        upload_rejection_reason, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    #[test]
+    fn upload_accepts_the_documents_the_relay_accepts() {
+        // Every one of these is taken by the relay's generic-file path, and
+        // every one was refused by the old five-entry allowlist.
+        for mime in [
+            "application/pdf",
+            "application/zip",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.oasis.opendocument.text",
+            "text/plain",
+            "text/csv",
+            "application/json",
+            // A file with no magic signature at all sniffs as this.
+            "application/octet-stream",
+        ] {
+            assert_eq!(upload_rejection_reason(mime), None, "refused {mime}");
+        }
+    }
+
+    #[test]
+    fn upload_still_accepts_the_canonical_media_types() {
+        for mime in [
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+            "video/mp4",
+        ] {
+            assert_eq!(upload_rejection_reason(mime), None, "refused {mime}");
+        }
+    }
+
+    #[test]
+    fn upload_refuses_active_content_and_executables() {
+        // SVG is the trap in this list: it is an image by name and a script
+        // host in fact, so it must stay refused however the rest widens.
+        for mime in [
+            "text/html",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "application/javascript",
+            "text/javascript",
+            "application/x-msdownload",
+            "application/x-mach-binary",
+            "application/vnd.android.package-archive",
+            "application/x-apple-diskimage",
+        ] {
+            assert!(
+                upload_rejection_reason(mime).is_some(),
+                "accepted dangerous {mime}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_refuses_media_types_the_relay_validators_do_not_handle() {
+        for mime in ["image/tiff", "image/bmp", "video/quicktime", "video/webm"] {
+            assert!(
+                upload_rejection_reason(mime).is_some(),
+                "accepted unhandled media {mime}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_refuses_audio_and_says_why() {
+        let reason = upload_rejection_reason("audio/mpeg").expect("audio must be refused");
+        assert!(
+            reason.contains("metadata sanitizer"),
+            "audio rejection should name the missing control, got: {reason}"
+        );
+    }
 
     #[test]
     fn query_cursor_uses_last_events_composite_sort_key() {
