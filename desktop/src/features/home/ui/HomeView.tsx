@@ -41,6 +41,7 @@ import {
   INBOX_SINGLE_COLUMN_BREAKPOINT_PX,
   useResizableInboxListWidth,
 } from "@/features/home/useResizableInboxListWidth";
+import { useInboxUnreadOnly } from "@/features/home/useInboxUnreadOnly";
 import { getHomePaneLayout } from "@/features/home/lib/homePaneLayout";
 import { getHomeMessageCapabilities } from "@/features/home/lib/homeMessageCapabilities";
 import { HomeLoadingState } from "@/features/home/ui/HomeLoadingState";
@@ -109,7 +110,7 @@ export function HomeView({
     homeInboxWidthPx > 0 &&
     homeInboxWidthPx < INBOX_SINGLE_COLUMN_BREAKPOINT_PX;
   const [filter, setFilter] = React.useState<InboxFilter>("all");
-  const [unreadOnly, setUnreadOnly] = React.useState(false);
+  const [unreadOnly, setUnreadOnly] = useInboxUnreadOnly();
   // Explicit selections are mirrored to the URL (`?item=`), so back/forward
   // restores the detail pane each history entry was showing and reloads
   // restore it from the URL. Default/automatic selection stays local-only —

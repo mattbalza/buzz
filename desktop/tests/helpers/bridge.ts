@@ -545,6 +545,17 @@ type BridgeOptions = {
    * that exercise the Experiments toggle UI itself.
    */
   seedPreviewFeatures?: boolean;
+  /**
+   * When true (default), seed the home inbox's unread-only filter as explicitly
+   * turned off, so the seeded fixture mail — which is mostly read — is visible.
+   *
+   * The shipped default is unread-only ON. Specs that assert on a particular
+   * inbox row are not testing the filter, and were all written against the "all"
+   * view, so this seeds the state of a user who has already switched it off
+   * rather than faking a different default. Pass false to exercise the real
+   * first-launch behaviour.
+   */
+  seedInboxUnreadOnly?: boolean;
   user?: keyof typeof TEST_IDENTITIES;
 };
 
@@ -750,6 +761,12 @@ async function seedDefaultCommunity(
   );
 }
 
+async function seedInboxUnreadOnlyOff(page: Page) {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("buzz.desktop.home-inbox-unread-only", "false");
+  });
+}
+
 async function seedPreviewFeaturesEnabled(page: Page) {
   await page.addInitScript(
     ({ key, ids }) => {
@@ -784,6 +801,11 @@ export async function installBridge(page: Page, options: BridgeOptions) {
   // Experiments toggle UI itself pass `seedPreviewFeatures: false`.
   if (options.seedPreviewFeatures !== false) {
     await seedPreviewFeaturesEnabled(page);
+  }
+  // The inbox ships filtered to unread. Specs asserting on a specific row want
+  // the whole list; only the spec that covers the default opts out.
+  if (options.seedInboxUnreadOnly !== false) {
+    await seedInboxUnreadOnlyOff(page);
   }
 
   await page.addInitScript(
@@ -889,6 +911,7 @@ export async function installMockBridge(
     skipOnboardingSeed?: boolean;
     skipCommunitySeed?: boolean;
     seedPreviewFeatures?: boolean;
+    seedInboxUnreadOnly?: boolean;
   },
 ) {
   await installBridge(page, {
@@ -899,13 +922,14 @@ export async function installMockBridge(
     skipOnboardingSeed: options?.skipOnboardingSeed,
     skipCommunitySeed: options?.skipCommunitySeed,
     seedPreviewFeatures: options?.seedPreviewFeatures,
+    seedInboxUnreadOnly: options?.seedInboxUnreadOnly,
   });
 }
 
 export async function installRelayBridge(
   page: Page,
   user: keyof typeof TEST_IDENTITIES = "tyler",
-  options?: { seedPreviewFeatures?: boolean },
+  options?: { seedPreviewFeatures?: boolean; seedInboxUnreadOnly?: boolean },
 ) {
   await installBridge(page, {
     mode: "relay",
