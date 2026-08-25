@@ -1108,7 +1108,12 @@ jobs:
 
   desktop-build-macos:
     name: Desktop Build (macOS)
-    runs-on: macos-latest
+    # Our own Mac Studio. This is the most expensive job in the run: on a private
+    # repo a hosted macOS minute bills at 10x, so these ~15 minutes were ~150 of
+    # the ~390 billable minutes every CI run cost. It is also the one job that
+    # can strand a PR — if the Mac Studio is asleep or offline the job sits
+    # queued rather than failing, so keep the machine awake on AC power.
+    runs-on: [self-hosted, macOS, ARM64, mac-studio]
     timeout-minutes: 45
     needs: [changes]
     if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
@@ -1116,6 +1121,17 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # Same guard as team-desktop-build.yml: a hosted runner starts clean, ours
+      # does not, and a full disk surfaces as an opaque linker failure.
+      - name: Check free disk
+        run: |
+          set -euo pipefail
+          FREE_GB=$(df -g /System/Volumes/Data | awk 'NR==2 {print $4}')
+          echo "free: ${FREE_GB} GiB"
+          if [[ "$FREE_GB" -lt 25 ]]; then
+            echo "::error::Only ${FREE_GB} GiB free on the Mac Studio; this build needs ~25 GiB. Reclaim space (\`rm -r ~/.cache/cargo-target\` is the usual 30 GiB) and re-run."
+            exit 1
+          fi
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:

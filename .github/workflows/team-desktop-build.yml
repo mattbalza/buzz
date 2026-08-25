@@ -16,6 +16,9 @@ name: Team Desktop Build
 # `--features mesh-llm` is omitted on all three platforms. It builds llama.cpp
 # from source for on-device inference; our agents run over the relay through
 # ACP, so nobody is served by the extra half hour of build time.
+#
+# The macOS jobs run on our own Mac Studio; Windows stays on a hosted runner
+# because we own no Windows hardware. See the `macos` job for why.
 
 concurrency:
   group: team-desktop-build-${{ github.ref }}
@@ -30,10 +33,15 @@ permissions:
 jobs:
   macos:
     name: macOS (${{ matrix.label }})
-    runs-on: macos-latest
+    # Our own Mac Studio. A private repo bills macOS minutes at a 10x
+    # multiplier, which made one installer build cost ~360 of a 2,000-minute
+    # monthly allowance. `max-parallel: 1` because there is exactly one runner
+    # and two concurrent Rust builds would exhaust its disk before either links.
+    runs-on: [self-hosted, macOS, ARM64, mac-studio]
     timeout-minutes: 90
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - label: Apple Silicon
@@ -48,6 +56,19 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+
+      # A hosted runner starts every job on a clean disk; ours does not. Running
+      # out of space mid-build surfaces as an opaque `cc-rs` linker failure forty
+      # minutes in, so check up front and say what to delete.
+      - name: Check free disk
+        run: |
+          set -euo pipefail
+          FREE_GB=$(df -g /System/Volumes/Data | awk 'NR==2 {print $4}')
+          echo "free: ${FREE_GB} GiB"
+          if [[ "$FREE_GB" -lt 25 ]]; then
+            echo "::error::Only ${FREE_GB} GiB free on the Mac Studio; this build needs ~25 GiB. Reclaim space (\`rm -r ~/.cache/cargo-target\` is the usual 30 GiB) and re-run."
+            exit 1
+          fi
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
@@ -103,6 +124,16 @@ jobs:
           name: buzz-desktop-${{ matrix.slug }}
           if-no-files-found: error
           path: ${{ env.dmg }}
+
+      # Compiled deps stay put — reusing them across runs is the whole reason to
+      # build here rather than on a hosted runner. Only the outputs go, and only
+      # once they are safely uploaded.
+      - name: Drop uploaded outputs
+        if: always()
+        run: |
+          rm -rf "desktop/src-tauri/target/${TARGET}/release/bundle" || true
+          rm -rf "${RUNNER_TEMP}/dmg-stage" "${RUNNER_TEMP}"/Buzz_*.dmg || true
+          df -h /System/Volumes/Data | awk 'NR==2 {print "free after cleanup: " $4}'
 
   windows:
     name: Windows (x64)
