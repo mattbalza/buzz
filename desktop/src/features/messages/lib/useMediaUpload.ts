@@ -8,6 +8,7 @@ import {
 import { uploadMediaFile } from "@/shared/api/tauriMedia";
 import type { QueuedMediaAttachment } from "./backgroundMediaUploadStore";
 import { applyImetaUpdate, compactImetaSlots } from "./imetaSlots";
+import { useFilePicker } from "./useFilePicker";
 import { isVideoFile, videoMimeForFile } from "./videoFileType";
 
 import {
@@ -643,19 +644,14 @@ export function useMediaUpload({
     [queueFiles, shouldQueueFile, uploadFiles],
   );
 
+  const openFilePicker = useFilePicker();
+
   const handlePaperclip = React.useCallback(async () => {
     if (queueUntilSend) {
-      const input = document.createElement("input");
-      input.type = "file";
-      input.multiple = true;
-      input.addEventListener(
-        "change",
-        () => {
-          acceptFiles(Array.from(input.files ?? []));
-        },
-        { once: true },
-      );
-      input.click();
+      // Through `acceptFiles`, not straight to queue/upload: the picker is an
+      // entry point like drop and paste, and the size cap has to hold on all
+      // three or the queue path accepts what send will refuse.
+      openFilePicker({ multiple: true }, acceptFiles);
       return;
     }
 
@@ -686,6 +682,7 @@ export function useMediaUpload({
     isUploadCanceled,
     isUploadStale,
     onUploadError,
+    openFilePicker,
     reserveUploadingPreview,
   ]);
 

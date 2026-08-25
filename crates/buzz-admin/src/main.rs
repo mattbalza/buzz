@@ -20,6 +20,8 @@
 //! newest timestamp and collide on the bumped second. run.sh serialization is
 //! the guard against parallel adds (e.g. `xargs -P`).
 
+mod deletions;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -81,12 +83,22 @@ enum Command {
         #[command(subcommand)]
         command: ProductFeedbackCommand,
     },
-    /// Emit kind:39000/39001/39002 events for channels missing them.
+    /// Durable CLI-only whole-community deletion control plane.
+    Deletions {
+        #[command(subcommand)]
+        command: deletions::DeletionsCommand,
+    },
+    /// Emit missing kind:39000/39001/39002 channel discovery events, or
+    /// republish only a targeted channel's kind:39002 roster.
     ///
-    /// Channels created via direct SQL (seed scripts, pre-migration data) won't
-    /// have Nostr discovery events. This command creates them so pure-nostr
-    /// clients can see those channels. Idempotent — safe to run multiple times.
+    /// Without `--channel`, only channels missing discovery metadata are
+    /// reconciled. With `--channel`, only that channel's member snapshot is
+    /// replaced; canonical metadata and admin events remain untouched.
     ReconcileChannels {
+        /// Optional channel UUID to force-republish.
+        #[arg(long)]
+        channel: Option<String>,
+
         /// Relay private key (hex) for signing events. Falls back to
         /// BUZZ_RELAY_PRIVATE_KEY env var. If neither is set, generates
         /// an ephemeral key (events will be unverifiable after restart).
@@ -156,8 +168,13 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::ProductFeedback {
             command: ProductFeedbackCommand::List { limit },
         } => cmd_list_product_feedback(limit).await,
-        Command::ReconcileChannels { relay_key, rebuild } => {
-            reconcile_channels(relay_key, rebuild).await?;
+        Command::Deletions { command } => deletions::run(command).await,
+        Command::ReconcileChannels {
+            channel,
+            relay_key,
+            rebuild,
+        } => {
+            reconcile_channels(channel, relay_key, rebuild).await?;
             Ok(0)
         }
     }
@@ -466,7 +483,11 @@ async fn resolve_admin_tenant(db: &Db) -> Result<TenantContext> {
     Ok(TenantContext::resolved(record.id, record.host))
 }
 
-async fn reconcile_channels(relay_key_arg: Option<String>, rebuild: bool) -> Result<()> {
+async fn reconcile_channels(
+    channel_arg: Option<String>,
+    relay_key_arg: Option<String>,
+    rebuild: bool,
+) -> Result<()> {
     use buzz_core::kind::{
         KIND_NIP29_GROUP_ADMINS, KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA,
     };
@@ -475,8 +496,17 @@ async fn reconcile_channels(relay_key_arg: Option<String>, rebuild: bool) -> Res
 
     let db = connect_db().await?;
 
-    // Resolve relay signing key: arg > env > ephemeral
-    let relay_keys = match relay_key_arg.or_else(|| std::env::var("BUZZ_RELAY_PRIVATE_KEY").ok()) {
+    // Resolve relay signing key: arg > env > ephemeral. Force-republish must
+    // never use an ephemeral key because it replaces an existing authoritative
+    // snapshot.
+    let configured_relay_key =
+        relay_key_arg.or_else(|| std::env::var("BUZZ_RELAY_PRIVATE_KEY").ok());
+    if channel_arg.is_some() && configured_relay_key.is_none() {
+        return Err(anyhow::anyhow!(
+            "--channel requires --relay-key or BUZZ_RELAY_PRIVATE_KEY"
+        ));
+    }
+    let relay_keys = match configured_relay_key {
         Some(key_hex) => {
             Keys::parse(&key_hex).map_err(|e| anyhow::anyhow!("invalid relay key: {e}"))?
         }
@@ -493,7 +523,21 @@ async fn reconcile_channels(relay_key_arg: Option<String>, rebuild: bool) -> Res
     };
 
     let tenant = resolve_admin_tenant(&db).await?;
-    let channels = db.list_channels(tenant.community(), None).await?;
+    let target_channel = channel_arg
+        .as_deref()
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid --channel UUID: {e}"))?;
+    let channels = if let Some(target) = target_channel {
+        vec![db
+            .get_channel(tenant.community(), target)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("channel {target} not found in community {}", tenant.host())
+            })?]
+    } else {
+        db.list_channels(tenant.community(), None).await?
+    };
     if channels.is_empty() {
         println!("No channels in database.");
         return Ok(());
@@ -516,7 +560,7 @@ async fn reconcile_channels(relay_key_arg: Option<String>, rebuild: bool) -> Res
             .await
             .unwrap_or_default();
 
-        if !existing.is_empty() && !rebuild {
+        if !existing.is_empty() && !rebuild && target_channel.is_none() {
             skipped += 1;
             continue;
         }
@@ -526,21 +570,37 @@ async fn reconcile_channels(relay_key_arg: Option<String>, rebuild: bool) -> Res
         // Same builders the relay signs with — see buzz_db::channel_discovery.
         // Reconcile once carried its own copy of these tag shapes and lost the
         // `archived` tag, which un-hid archived channels in every client while
-        // the database still said archived.
-        for (kind, tags) in [
-            (
-                KIND_NIP29_GROUP_METADATA,
-                nip29_metadata_tags(channel, &members),
-            ),
-            (
-                KIND_NIP29_GROUP_ADMINS,
-                nip29_admins_tags(channel.id, &members),
-            ),
-            (
+        // the database still said archived. Upstream's targeted repair kept a
+        // second open-coded copy and then had to fence it off as "richer than
+        // this legacy backfill builder" — one shared builder removes the reason
+        // the fence existed.
+        //
+        // `--channel` still means roster-only, for upstream's other reason: a
+        // targeted repair exists to replace a stale kind:39002 snapshot, and
+        // rewriting canonical metadata on the way past is a blast radius nobody
+        // asked for.
+        let pending = if target_channel.is_some() {
+            vec![(
                 KIND_NIP29_GROUP_MEMBERS,
                 nip29_members_tags(channel.id, &members),
-            ),
-        ] {
+            )]
+        } else {
+            vec![
+                (
+                    KIND_NIP29_GROUP_METADATA,
+                    nip29_metadata_tags(channel, &members),
+                ),
+                (
+                    KIND_NIP29_GROUP_ADMINS,
+                    nip29_admins_tags(channel.id, &members),
+                ),
+                (
+                    KIND_NIP29_GROUP_MEMBERS,
+                    nip29_members_tags(channel.id, &members),
+                ),
+            ]
+        };
+        for (kind, tags) in pending {
             let tags: Vec<Tag> = tags
                 .into_iter()
                 .map(Tag::parse)
@@ -556,7 +616,11 @@ async fn reconcile_channels(relay_key_arg: Option<String>, rebuild: bool) -> Res
         reconciled += 1;
     }
 
-    let verb = if rebuild { "Republished" } else { "Reconciled" };
+    let verb = if rebuild || target_channel.is_some() {
+        "Republished"
+    } else {
+        "Reconciled"
+    };
     println!(
         "{verb} {reconciled} channels ({skipped} already had events, {} total).",
         channels.len()
