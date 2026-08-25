@@ -136,6 +136,10 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
+    // The gate is a process-wide static shared by every test in this binary,
+    // so all tests that arm it serialize on one async lock to keep expiries
+    // from bleeding between parallel test threads.
+
     #[tokio::test(start_paused = true)]
     async fn wait_returns_immediately_when_gate_is_inactive() {
         let _gate = test_support::lock_gate().await;

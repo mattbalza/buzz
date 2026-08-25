@@ -30,17 +30,37 @@ async function seedLongThread(page: import("@playwright/test").Page) {
   });
 }
 
-async function topVisibleMessageId(
+async function scrollToMiddleVisibleMessage(
   body: import("@playwright/test").Locator,
+  threadRootId: string,
 ): Promise<string> {
-  return body.evaluate((element) => {
-    const top = element.getBoundingClientRect().top;
-    const row = Array.from(
-      element.querySelectorAll<HTMLElement>("[data-message-id]"),
-    ).find((candidate) => candidate.getBoundingClientRect().bottom > top);
-    if (!row?.dataset.messageId) throw new Error("No visible thread anchor");
-    return row.dataset.messageId;
-  });
+  let anchorId: string | null = null;
+  await expect
+    .poll(async () => {
+      anchorId = await body.evaluate((element) => {
+        const maxScrollTop = element.scrollHeight - element.clientHeight;
+        if (maxScrollTop <= 0) return null;
+
+        const targetScrollTop = Math.floor(maxScrollTop * 0.4);
+        element.scrollTop = targetScrollTop;
+        element.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+        if (Math.abs(element.scrollTop - targetScrollTop) > 1) return null;
+        const bounds = element.getBoundingClientRect();
+        const row = Array.from(
+          element.querySelectorAll<HTMLElement>("[data-message-id]"),
+        ).find((candidate) => {
+          const rect = candidate.getBoundingClientRect();
+          return rect.bottom > bounds.top && rect.top < bounds.bottom;
+        });
+        return row?.dataset.messageId ?? null;
+      });
+      return anchorId !== null && anchorId !== threadRootId;
+    })
+    .toBe(true);
+
+  if (!anchorId) throw new Error("No visible middle-thread anchor");
+  return anchorId;
 }
 
 /**
@@ -181,36 +201,11 @@ test("focus and split preserve reading context and interaction ownership", async
     .toBe(true);
   await expect(channel).toHaveAttribute("inert", "");
 
-  // Scroll the way a reader does — a synthetic `scrollTop` write plus a faked
-  // `scroll` event races the app's own post-open scroll work, so a green run
-  // could just mean the app had already moved the position we sampled.
-  await body.hover();
-  await page.mouse.wheel(
-    0,
-    -(await body.evaluate(
-      (element) => (element.scrollHeight - element.clientHeight) * 0.6,
-    )),
-  );
+  const anchorId = await scrollToMiddleVisibleMessage(body, rootId);
 
-  // Only sample the anchor once the position holds across two polls: anything
-  // the app still has queued must land before the reading row is recorded.
-  let topVisibleId: string | null = null;
-  await expect
-    .poll(
-      async () => {
-        const current = await topVisibleMessageId(body);
-        const held = current === topVisibleId;
-        topVisibleId = current;
-        return held;
-      },
-      { intervals: [200, 200, 200, 200, 200] },
-    )
-    .toBe(true);
-  const anchorId = topVisibleId as string;
-
-  // The scroll itself has to survive the thread's own post-open scroll work.
-  // If the view snaps back to the newest reply, every assertion below is
-  // vacuously true — it would be preserving the bottom, not a reading position.
+  // The scroll has to survive the thread's own post-open scroll work. If the
+  // view snaps back to the newest reply, every assertion below is vacuously
+  // true — it would be preserving the bottom, not a reading position.
   expect(
     await body.evaluate(
       (element) =>

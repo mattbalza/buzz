@@ -3,10 +3,16 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 function git(args, cwd, options = {}) {
+  // Git hooks export repository-local GIT_* variables. Child commands that
+  // intentionally target `cwd` must not be redirected back to the hook's repo.
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+  );
   return execFileSync("git", args, {
     cwd,
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
+    env,
     ...options,
   });
 }
@@ -107,6 +113,64 @@ function readBaseFile(repoRoot, baseRef, filePath) {
   }).toString("utf8");
 }
 
+// Probes whose failure is an expected answer, not an error: `git` still
+// writes to stderr, and inherited stderr would bury the ratchet's own report
+// under one `fatal:` line per file per base.
+function gitProbe(args, cwd) {
+  try {
+    git(args, cwd, { stdio: ["ignore", "pipe", "ignore"] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function parseMergeParents(revListOutput) {
+  return revListOutput
+    .split("\n")
+    .filter(Boolean)
+    .flatMap((line) => line.trim().split(/\s+/).slice(2));
+}
+
+/**
+ * Additional base refs contributed by merges being brought in.
+ *
+ * The ratchet asks "did *you* grow this file". With a single base that
+ * question is the same as "is it bigger than on main" — until the branch
+ * merges an outside history. An upstream ingest merges hundreds of commits at
+ * once, and every file the other side had already grown reads as this branch's
+ * growth, in code nobody here wrote and nobody here should shrink to land the
+ * merge.
+ *
+ * So each merge in `base..HEAD` donates its non-first parents as extra bases.
+ * A file may then be as large as the largest side it came from — and not one
+ * line larger, which is the discipline the ratchet exists to enforce. Parents
+ * already reachable from the base are dropped: an ordinary topic-branch merge
+ * adds nothing here, and must not.
+ */
+export function resolveMergedInBaseRefs(repoRoot, baseRef) {
+  if (baseRef === "HEAD") return [];
+
+  const parents = parseMergeParents(
+    git(["rev-list", "--merges", "--parents", `${baseRef}..HEAD`], repoRoot),
+  );
+
+  return [...new Set(parents)].filter(
+    (parent) =>
+      !gitProbe(["merge-base", "--is-ancestor", parent, baseRef], repoRoot),
+  );
+}
+
+function baseLineCount(repoRoot, baseRefs, filePath) {
+  let largest = null;
+  for (const ref of baseRefs) {
+    if (!gitProbe(["cat-file", "-e", `${ref}:${filePath}`], repoRoot)) continue;
+    const lines = countLines(readBaseFile(repoRoot, ref, filePath));
+    if (largest == null || lines > largest) largest = lines;
+  }
+  return largest;
+}
+
 export async function runFileSizeCheck({ projectRoot, rules, label }) {
   // Every governed project is a direct child of the repository root. Derive
   // these paths without Git so hook-provided repository environment variables
@@ -117,6 +181,8 @@ export async function runFileSizeCheck({ projectRoot, rules, label }) {
 
   // Fail clearly instead of silently turning a missing/shallow base into a pass.
   git(["cat-file", "-e", `${baseRef}^{commit}`], repoRoot);
+
+  const baseRefs = [baseRef, ...resolveMergedInBaseRefs(repoRoot, baseRef)];
 
   const violations = [];
   for (const change of changedProjectFiles({
@@ -135,9 +201,10 @@ export async function runFileSizeCheck({ projectRoot, rules, label }) {
     const candidatePath = path.join(repoRoot, change.path);
     const candidateLines = countLines(await fs.readFile(candidatePath, "utf8"));
     const basePath = change.oldPath ?? change.path;
-    const baseContent =
-      change.status === "A" ? null : readBaseFile(repoRoot, baseRef, basePath);
-    const baseLines = baseContent == null ? null : countLines(baseContent);
+    // Not gated on `status === "A"`: a file this branch adds may still exist
+    // in a merged-in parent, having arrived at that size rather than grown to
+    // it. `baseLineCount` returns null only when no base has it at all.
+    const baseLines = baseLineCount(repoRoot, baseRefs, basePath);
     const result = evaluateFileSize({
       baseLines,
       candidateLines,
@@ -156,7 +223,7 @@ export async function runFileSizeCheck({ projectRoot, rules, label }) {
 
   if (violations.length === 0) return;
 
-  console.error(`${label} file size ratchet failed (base ${baseRef}):`);
+  console.error(`${label} file size ratchet failed (base ${baseRefs.join(", ")}):`);
   for (const violation of violations) {
     const before = violation.baseLines == null ? "new" : violation.baseLines;
     const delta =

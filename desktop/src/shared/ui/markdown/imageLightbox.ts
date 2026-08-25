@@ -316,9 +316,15 @@ function imageGalleryItemFromTrigger(
     return null;
   }
 
+  const image = trigger.querySelector("img");
+  const inferredDim =
+    image && image.naturalWidth > 0 && image.naturalHeight > 0
+      ? `${image.naturalWidth}x${image.naturalHeight}`
+      : undefined;
+
   return {
     alt: trigger.dataset.imageLightboxAlt || undefined,
-    dim: trigger.dataset.imageLightboxDim || undefined,
+    dim: trigger.dataset.imageLightboxDim || inferredDim,
     resolvedSrc,
     src: trigger.dataset.imageLightboxSrc || undefined,
     thumbnailBox: thumbnail?.box,

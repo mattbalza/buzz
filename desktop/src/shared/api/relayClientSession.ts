@@ -14,10 +14,13 @@ import {
 } from "@/shared/constants/kinds";
 import {
   getTextPayload,
+  toRelayFrames,
   type ConnectionState,
+  type LiveSubscriptionReadiness,
   type PendingEvent,
   type RelaySubscription,
   type RelaySubscriptionFilter,
+  type SubscriptionEventBufferItem,
 } from "@/shared/api/relayClientShared";
 import {
   buildChannelAuxDeletionFilter,
@@ -28,10 +31,12 @@ import {
 } from "@/shared/api/relayChannelFilters";
 import {
   clearClosedRetry,
+  flushEvents,
   handleRelayClosed,
   handleSubscriptionEose,
   prepareSubscriptionEvent,
 } from "@/shared/api/relayClosedRecovery";
+import { getChannelReconnectRepairEvents } from "@/shared/api/channelReconnectRepair";
 import { replayLiveSubscriptions } from "@/shared/api/relayReconnectReplay";
 import {
   activateRateLimit,
@@ -66,7 +71,12 @@ import {
   STALL_IDLE_TIMEOUT_MS,
 } from "@/shared/api/relayClientTimings";
 import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
-import { AuthOkTracker } from "@/shared/api/relayAuthPolicy";
+import {
+  armRelayAuthentication,
+  AuthOkTracker,
+  type RelayAuthRequest,
+} from "@/shared/api/relayAuthPolicy";
+import { createRelayInboundBuffer } from "@/shared/api/relayInboundBuffer";
 import { buildThreadReferenceTags } from "@/features/messages/lib/threading";
 
 export class RelayClient {
@@ -77,15 +87,10 @@ export class RelayClient {
   private reconnectWaiters = new RelayReconnectWaiters();
   private reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
   private keepAliveRequested = false;
-  private authRequest: {
-    pendingEventId: string;
-    resolve: () => void;
-    reject: (error: Error) => void;
-    timeout: number;
-  } | null = null;
+  private authRequest: RelayAuthRequest | null = null;
   private subscriptions = new Map<string, RelaySubscription>();
   private pendingEvents = new Map<string, PendingEvent>();
-  private eventBuffer: Array<{ subId: string; event: RelayEvent }> = [];
+  private eventBuffer: SubscriptionEventBufferItem[] = [];
   private flushTimeout: number | null = null;
   private reconnectListeners = new Set<() => void>();
   private hasConnectedOnce = false;
@@ -95,7 +100,6 @@ export class RelayClient {
   private stabilityTimer: number | null = null;
   private visibleChannelId: string | null = null;
   private authOkTracker = new AuthOkTracker();
-
   private terminal = false;
 
   private connectionStateEmitter = new RelayConnectionStateEmitter("idle");
@@ -107,11 +111,9 @@ export class RelayClient {
       this.resetConnection(error);
     },
   });
-
   setVisibleChannelId(id: string | null) {
     this.visibleChannelId = id;
   }
-
   disconnect() {
     const error = new Error("Relay disconnected for community switch.");
 
@@ -377,10 +379,6 @@ export class RelayClient {
     );
   }
 
-  async subscribeToPresenceUpdates(onEvent: (event: RelayEvent) => void) {
-    return this.subscribe({ kinds: [20001], limit: 0 }, onEvent);
-  }
-
   async publishUserStatus(text: string, emoji: string): Promise<void> {
     await this.ensureConnected();
     const tags: string[][] = [["d", "general"]];
@@ -412,10 +410,11 @@ export class RelayClient {
   async subscribeLive(
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
+    onReady?: (readiness: LiveSubscriptionReadiness) => void,
+    readinessTimeoutMs?: number,
   ) {
-    return this.subscribe(filter, onEvent);
+    return this.subscribe(filter, onEvent, onReady, readinessTimeoutMs);
   }
-
   async subscribeToChannelMentionEvents(
     channelId: string,
     pubkey: string,
@@ -426,7 +425,6 @@ export class RelayClient {
       onEvent,
     );
   }
-
   async preconnect() {
     // Explicit re-engagement (reconnect card / community switch): clears the
     // terminal latch and AUTH rejection streak, and bypasses backoff once.
@@ -533,17 +531,20 @@ export class RelayClient {
     this.connectionStateEmitter.set(
       this.hasConnectedOnce ? "reconnecting" : "connecting",
     );
-
     const generation = ++this.connectionGeneration;
-    this.onMessageChannel = new Channel<unknown>((message) => {
-      void this.handleWsMessage(message, generation).catch((error) => {
-        if (generation !== this.connectionGeneration) return;
-        this.resetConnection(
-          this.normalizeRelayError(error, "Relay connection errored."),
-        );
-      });
-    });
-
+    const inbound = createRelayInboundBuffer(
+      async (delivery) => {
+        for (const message of toRelayFrames(delivery))
+          await this.handleWsMessage(message, generation);
+      },
+      (error) => {
+        if (generation === this.connectionGeneration)
+          this.recoverFromSocketFailure(error, "Relay connection errored.");
+      },
+    );
+    this.onMessageChannel = new Channel<unknown>((delivery) =>
+      inbound.receive(delivery),
+    );
     try {
       if (!this.relayUrl) {
         this.relayUrl = await getRelayWsUrl();
@@ -559,31 +560,28 @@ export class RelayClient {
       }
       this.wsId = wsId;
 
-      await new Promise<void>((resolve, reject) => {
-        const timeout = window.setTimeout(() => {
-          const error = new Error("Relay authentication timed out.");
+      const authentication = armRelayAuthentication(
+        AUTH_TIMEOUT_MS,
+        (request) => {
+          this.authRequest = request;
+        },
+        (error) => {
           this.authRequest = null;
           this.resetConnection(error);
-          reject(error);
-        }, AUTH_TIMEOUT_MS);
+        },
+      );
 
-        this.authRequest = {
-          pendingEventId: "",
-          resolve,
-          reject,
-          timeout,
-        };
-      });
-
+      const drain = inbound.drain();
+      await Promise.race([drain, authentication, inbound.overflow]);
+      await drain;
+      await authentication;
       this.stabilityTimer = window.setTimeout(() => {
         this.stabilityTimer = null;
         this.reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
       }, BACKOFF_RESET_STABLE_MS);
 
       this.connectionStateEmitter.set("connected");
-      await this.replayLiveSubscriptions();
-      this.stallWatchdog.start();
-      this.emitReconnectIfNeeded();
+      this.startSubscriptionReplay(generation);
     } catch (error) {
       const connectionError = this.normalizeRelayError(
         error,
@@ -599,22 +597,24 @@ export class RelayClient {
   private async subscribe(
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
+    onReady?: (readiness: LiveSubscriptionReadiness) => void,
+    readinessTimeoutMs = 250,
   ) {
     await this.ensureConnected();
 
     const subId = `live-${crypto.randomUUID()}`;
-    let resolveReady = () => {
-      return;
-    };
+    let resolveReady = (_readiness: LiveSubscriptionReadiness) => {};
     const ready = new Promise<void>((resolve) => {
-      resolveReady = () => {
+      resolveReady = (readiness) => {
         window.clearTimeout(fallbackTimeout);
+        onReady?.(readiness);
         resolve();
       };
     });
-    const fallbackTimeout = window.setTimeout(() => {
-      resolveReady();
-    }, 250);
+    const fallbackTimeout = window.setTimeout(
+      () => resolveReady("timeout"),
+      readinessTimeoutMs,
+    );
 
     this.subscriptions.set(subId, {
       mode: "live",
@@ -790,7 +790,7 @@ export class RelayClient {
       return;
     }
     if (type === "EVENT" && typeof rest[0] === "string" && rest[1]) {
-      this.handleEvent(rest[0], rest[1] as RelayEvent);
+      this.handleEvent(rest[0], rest[1] as RelayEvent, generation);
       return;
     }
 
@@ -808,7 +808,7 @@ export class RelayClient {
     }
 
     if (type === "EOSE" && typeof rest[0] === "string") {
-      this.handleEose(rest[0]);
+      this.handleEose(rest[0], generation);
       return;
     }
 
@@ -853,7 +853,7 @@ export class RelayClient {
     await this.sendRaw(["AUTH", event]);
   }
 
-  private handleEvent(subId: string, event: RelayEvent) {
+  private handleEvent(subId: string, event: RelayEvent, generation: number) {
     const subscription = this.subscriptions.get(subId);
     if (!subscription) {
       return;
@@ -865,7 +865,7 @@ export class RelayClient {
     }
 
     if (!prepareSubscriptionEvent(subscription, event)) return;
-    this.eventBuffer.push({ subId, event });
+    this.eventBuffer.push({ subId, event, generation });
     this.flushTimeout ??= window.setTimeout(
       () => this.flushEventBuffer(),
       EVENT_BATCH_MS,
@@ -877,20 +877,16 @@ export class RelayClient {
     const buffer = this.eventBuffer;
     this.eventBuffer = [];
 
-    // Re-lookup: subscriptions removed during batch window are intentionally skipped.
-    for (const { subId, event } of buffer) {
-      const subscription = this.subscriptions.get(subId);
-      if (subscription?.mode === "live") {
-        subscription.onEvent(event);
-      }
-    }
+    flushEvents(buffer, this.subscriptions, this.connectionGeneration);
   }
 
-  private handleEose(subId: string) {
+  private handleEose(subId: string, generation: number) {
+    this.flushEventBuffer(); // Deliver preceding EVENT frames before EOSE.
     handleSubscriptionEose({
       subscriptions: this.subscriptions,
       subId,
       closeSubscription: (id) => this.closeSubscription(id),
+      generation,
     });
   }
 
@@ -932,24 +928,29 @@ export class RelayClient {
     return [...this.subscriptions.values()].some((s) => s.mode === "live");
   }
 
-  private async replayLiveSubscriptions() {
-    const generation = this.connectionGeneration;
-    try {
-      await replayLiveSubscriptions({
-        subscriptions: this.subscriptions,
-        sendRaw: (payload) => this.sendRaw(payload),
-        requestHistory: (filter) => this.requestHistory(filter),
-        visibleChannelId: this.visibleChannelId,
-        isActive: () => this.connectionGeneration === generation,
-      });
-    } catch (error) {
-      const reconnectError =
-        error instanceof Error
-          ? error
-          : new Error("Failed to restore relay subscriptions.");
-      this.resetConnection(reconnectError);
-      throw reconnectError;
-    }
+  /**
+   * Restore live subscriptions — detached from `connect()`: awaiting it there
+   * put budget-paced replay inside `relayReconnectController`'s 11 s
+   * `fastPathTimeoutMs`, which then killed healthy sockets on every reconnect
+   * (542 connections in 6 h, 11.3 s median, for one 40+-channel pubkey).
+   */
+  private startSubscriptionReplay(generation: number) {
+    void replayLiveSubscriptions({
+      subscriptions: this.subscriptions,
+      sendRaw: (payload) => this.sendRaw(payload),
+      requestRepair: getChannelReconnectRepairEvents,
+      generation,
+      visibleChannelId: this.visibleChannelId,
+      isActive: () => this.connectionGeneration === generation,
+    })
+      .then(() => {
+        if (generation !== this.connectionGeneration) return;
+        this.stallWatchdog.start();
+        this.emitReconnectIfNeeded();
+      })
+      .catch((error) =>
+        this.recoverFromSocketFailure(error, "Failed to restore relay subs."),
+      );
   }
 
   private scheduleReconnect() {
@@ -1068,18 +1069,15 @@ export class RelayClient {
         this.subscriptions.delete(subId);
         continue;
       }
-
-      subscription.resolveReady?.();
+      subscription.resolveReady?.("closed");
       subscription.resolveReady = undefined;
       clearClosedRetry(subscription);
     }
-
     for (const [eventId, pendingEvent] of this.pendingEvents) {
       window.clearTimeout(pendingEvent.timeout);
       pendingEvent.reject(error);
       this.pendingEvents.delete(eventId);
     }
-
     if (options?.reconnect !== false) {
       this.scheduleReconnect();
     }

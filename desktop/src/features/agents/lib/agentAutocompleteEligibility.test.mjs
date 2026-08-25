@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   coalesceAgentAutocompleteCandidates,
+  filterAdmittedMentionPubkeys,
   filterCachedAgentSuggestions,
+  getAgentMentionAdmission,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
   isAgentIdentityInAllowedList,
@@ -64,11 +66,13 @@ test("relayAgentIsSharedWithUser: accepts shared anyone agents and rejects unsha
   assert.equal(
     relayAgentIsSharedWithUser(
       {
+        ownerPubkey: OTHER_OWNER_PUBKEY,
         respondTo: "owner-only",
         respondToAllowlist: [],
         channelIds: ["general"],
       },
       sharedChannelIds,
+      CURRENT_PUBKEY,
     ),
     false,
   );
@@ -78,6 +82,22 @@ test("relayAgentIsSharedWithUser: accepts shared anyone agents and rejects unsha
       sharedChannelIds,
     ),
     false,
+  );
+});
+
+test("relayAgentIsSharedWithUser: accepts verified same-owner agents across machines", () => {
+  assert.equal(
+    relayAgentIsSharedWithUser(
+      {
+        ownerPubkey: CURRENT_PUBKEY.toUpperCase(),
+        respondTo: "owner-only",
+        respondToAllowlist: [],
+        channelIds: ["general"],
+      },
+      new Set(["general"]),
+      CURRENT_PUBKEY,
+    ),
+    true,
   );
 });
 
@@ -307,7 +327,7 @@ test("shouldHideAgentFromMentions: hides member agents with an explicit not-invo
   );
 });
 
-test("shouldHideAgentFromMentions: shows member agents with unknown invocability (not in directory)", () => {
+test("shouldHideAgentFromMentions: hides member agents without an affirmative directory grant", () => {
   assert.equal(
     shouldHideAgentFromMentions({
       isAgent: true,
@@ -315,6 +335,74 @@ test("shouldHideAgentFromMentions: shows member agents with unknown invocability
       pubkey: PUB_A,
       mentionableAgentPubkeys: new Set(),
       directoryAgentPubkeys: new Set(),
+    }),
+    true,
+  );
+});
+
+test("shouldHideAgentFromMentions: hides unknown member agents while directories load", () => {
+  assert.equal(
+    shouldHideAgentFromMentions({
+      isAgent: true,
+      isMember: true,
+      pubkey: PUB_A,
+      mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set(),
+      directoryReady: false,
+    }),
+    true,
+  );
+});
+
+test("shouldHideAgentFromMentions: hides mentionable member agents while directories load", () => {
+  assert.equal(
+    shouldHideAgentFromMentions({
+      isAgent: true,
+      isMember: true,
+      pubkey: PUB_A,
+      mentionableAgentPubkeys: new Set([PUB_A]),
+      directoryAgentPubkeys: new Set(),
+      directoryReady: false,
+    }),
+    true,
+  );
+});
+
+test("shouldHideAgentFromMentions: shows non-agent members while directories load", () => {
+  assert.equal(
+    shouldHideAgentFromMentions({
+      isAgent: false,
+      isMember: true,
+      pubkey: PUB_A,
+      mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set([PUB_A]),
+      directoryReady: false,
+    }),
+    false,
+  );
+});
+
+test("shouldHideAgentFromMentions: hides unknown member agents after empty directories settle", () => {
+  assert.equal(
+    shouldHideAgentFromMentions({
+      isAgent: true,
+      isMember: true,
+      pubkey: PUB_A,
+      mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set(),
+      directoryReady: true,
+    }),
+    true,
+  );
+});
+
+test("shouldHideAgentFromMentions: shows authorized agents without managed-owner policy", () => {
+  assert.equal(
+    shouldHideAgentFromMentions({
+      isAgent: true,
+      pubkey: PUB_A,
+      mentionableAgentPubkeys: new Set([PUB_A]),
+      directoryReady: true,
     }),
     false,
   );
@@ -336,7 +424,48 @@ test("shouldHideAgentFromMentions: normalizes the pubkey before lookup", () => {
   );
 });
 
-test("coalesceAgentAutocompleteCandidates: merges agents with the same persona id", () => {
+test("getAgentMentionAdmission: authorized relay agents are independent of owner", () => {
+  const common = {
+    isAgent: true,
+    pubkey: PUB_A,
+    mentionableAgentPubkeys: new Set([PUB_A]),
+    directoryReady: true,
+  };
+
+  assert.equal(getAgentMentionAdmission(common), "allow");
+  assert.equal(
+    getAgentMentionAdmission({
+      ...common,
+      mentionableAgentPubkeys: new Set(),
+    }),
+    "deny",
+  );
+});
+
+test("getAgentMentionAdmission: unresolved directory state stays unknown", () => {
+  assert.equal(
+    getAgentMentionAdmission({
+      isAgent: true,
+      pubkey: PUB_A,
+      mentionableAgentPubkeys: new Set([PUB_A]),
+      directoryReady: false,
+    }),
+    "unknown",
+  );
+});
+
+test("filterAdmittedMentionPubkeys: rechecks agent admission without dropping people", () => {
+  assert.deepEqual(
+    filterAdmittedMentionPubkeys(
+      [PUB_A, PUB_B, PUB_C],
+      new Set([PUB_A, PUB_B]),
+      new Set([PUB_B]),
+    ),
+    [PUB_B, PUB_C],
+  );
+});
+
+test("coalesceAgentAutocompleteCandidates: keeps agents with the same persona id distinct", () => {
   const first = makeAgent({ pubkey: PUB_A, personaId: "pinky" });
   const second = makeAgent({
     pubkey: PUB_B,
@@ -344,10 +473,10 @@ test("coalesceAgentAutocompleteCandidates: merges agents with the same persona i
     isMember: true,
   });
 
-  assert.deepEqual(coalesce([first, second]), [second]);
+  assert.deepEqual(coalesce([first, second]), [first, second]);
 });
 
-test("coalesceAgentAutocompleteCandidates: merges agents with the same owner and name", () => {
+test("coalesceAgentAutocompleteCandidates: keeps agents with the same owner and name distinct", () => {
   const first = makeAgent({ pubkey: PUB_A, ownerPubkey: OWNER_PUBKEY });
   const second = makeAgent({
     pubkey: PUB_B,
@@ -355,7 +484,7 @@ test("coalesceAgentAutocompleteCandidates: merges agents with the same owner and
     isMember: true,
   });
 
-  assert.deepEqual(coalesce([first, second]), [second]);
+  assert.deepEqual(coalesce([first, second]), [first, second]);
 });
 
 test("coalesceAgentAutocompleteCandidates: keeps same-name agents with different owners distinct", () => {
@@ -382,12 +511,22 @@ test("coalesceAgentAutocompleteCandidates: keeps owner-less managed same-name ag
   assert.deepEqual(coalesce([first, second]), [first, second]);
 });
 
-test("coalesceAgentAutocompleteCandidates: merges current-owner same-name agents", () => {
+test("coalesceAgentAutocompleteCandidates: keeps current-owner same-name agents distinct", () => {
   const first = makeAgent({ pubkey: PUB_A, ownerPubkey: CURRENT_PUBKEY });
   const second = makeAgent({
     pubkey: PUB_B,
     ownerPubkey: CURRENT_PUBKEY,
     isManagedAgent: true,
+  });
+
+  assert.deepEqual(coalesce([first, second]), [first, second]);
+});
+
+test("coalesceAgentAutocompleteCandidates: coalesces repeated source rows for the same pubkey", () => {
+  const first = makeAgent({ pubkey: PUB_A });
+  const second = makeAgent({
+    pubkey: PUB_A.toUpperCase(),
+    isMember: true,
   });
 
   assert.deepEqual(coalesce([first, second]), [second]);

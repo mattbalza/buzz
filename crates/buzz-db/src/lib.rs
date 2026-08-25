@@ -8,6 +8,21 @@
 //! - Events table is partitioned by month on `created_at`.
 //! - No FK references to partitioned tables.
 //! - Uses `sqlx::query()` (runtime) not `sqlx::query!()` (compile-time).
+//!
+//! ## Runtime and store ownership
+//! This crate intentionally keeps database runtime and Buzz domain persistence
+//! together while maintaining an internal boundary between them:
+//!
+//! - Runtime concerns own pool construction, writer/replica routing, transaction
+//!   creation, session invariants, metrics, and health support.
+//! - Store concerns own domain-specific SQL, row mapping, locking, mutation
+//!   rules, indexes, and focused persistence tests.
+//!
+//! Transaction-required store operations accept [`sqlx::Transaction`] so their
+//! composition requirement is visible in the type. Private connection helpers
+//! are reserved for SQL primitives that are valid on any same-session
+//! connection. New domains should prove this boundary incrementally instead of
+//! exposing raw pools or introducing broad store traits.
 
 /// Explicit deployment-global admin report reads.
 pub mod admin_moderation;
@@ -19,6 +34,8 @@ pub mod archived_identities;
 pub mod channel;
 /// NIP-29 discovery-event tags derived from channel rows.
 pub mod channel_discovery;
+/// Durable whole-community deletion lifecycle and PostgreSQL adapter.
+pub mod deletion;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
@@ -45,6 +62,8 @@ pub mod reaction;
 pub mod relay_invite;
 /// Relay-level membership persistence (NIP-43).
 pub mod relay_members;
+/// Replaceable-event persistence and coordinate locking.
+pub mod replaceable;
 /// Replica freshness fence for keyset-cursor read routing.
 pub mod replica_fence;
 /// Thread metadata persistence.
@@ -59,6 +78,7 @@ pub mod workflow;
 pub use error::{DbError, Result};
 pub use event::{EventQuery, ReactionEventInsertOutcome, DEFAULT_MAX_PAGE_LIMIT};
 
+use buzz_datastore_tracing::datastore_span;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool, QueryBuilder, Row};
@@ -67,39 +87,29 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
-fn event_replacement_lock_key(
-    community_id: CommunityId,
-    kind: i32,
-    pubkey: &[u8],
-    coordinate: Option<&[u8]>,
-) -> i64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    let kind_bytes = kind.to_le_bytes();
-    for bytes in [
-        community_id.as_uuid().as_bytes().as_slice(),
-        kind_bytes.as_slice(),
-        pubkey,
-    ] {
-        for byte in bytes {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    if let Some(coordinate) = coordinate {
-        for byte in coordinate {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    hash as i64
-}
-
 /// Extract p-tag mentions from an event and insert into the `event_mentions` table.
 ///
-/// Called after event insertion. Failures are logged but do not block event storage.
-/// Uses `INSERT ... ON CONFLICT DO NOTHING` so duplicate inserts are silently skipped.
+/// This pool-owning wrapper propagates failures to its caller. Replacement writes
+/// use the transaction-bound helper below so event storage and mention indexing
+/// commit or roll back together. Duplicate inserts are silently skipped with
+/// `INSERT ... ON CONFLICT DO NOTHING`.
 pub async fn insert_mentions(
     pool: &PgPool,
+    community_id: CommunityId,
+    event: &nostr::Event,
+    channel_id: Option<Uuid>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Insert mention rows on the caller's transaction. Replacement writes use
+/// this so the authoritative event and its discovery index commit or roll back
+/// as one unit.
+async fn insert_mentions_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community_id: CommunityId,
     event: &nostr::Event,
     channel_id: Option<Uuid>,
@@ -149,24 +159,31 @@ pub async fn insert_mentions(
         return Ok(());
     }
 
-    // Single multi-row INSERT ... ON CONFLICT DO NOTHING — one round-trip regardless of mention count.
-    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-        "INSERT INTO event_mentions \
-         (community_id, pubkey_hex, event_id, event_created_at, channel_id, event_kind) ",
-    );
+    // Multi-row INSERT ... ON CONFLICT DO NOTHING, chunked to stay under
+    // Postgres's 65,535 bind-parameter statement cap (6 binds per row caps a
+    // single statement at ~10.9k rows). Relay-signed kind 39002 rosters carry
+    // one p-tag per channel member and can exceed that. The caller owns the
+    // transaction so all chunks share its commit boundary.
+    const MENTION_INSERT_CHUNK_ROWS: usize = 5_000;
+    for chunk in valid_pubkeys.chunks(MENTION_INSERT_CHUNK_ROWS) {
+        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+            "INSERT INTO event_mentions \
+             (community_id, pubkey_hex, event_id, event_created_at, channel_id, event_kind) ",
+        );
 
-    qb.push_values(&valid_pubkeys, |mut b, pubkey| {
-        b.push_bind(community_id.as_uuid())
-            .push_bind(pubkey.as_str())
-            .push_bind(event_id_bytes.as_slice())
-            .push_bind(created_at)
-            .push_bind(channel_id)
-            .push_bind(kind as i32);
-    });
+        qb.push_values(chunk, |mut b, pubkey| {
+            b.push_bind(community_id.as_uuid())
+                .push_bind(pubkey.as_str())
+                .push_bind(event_id_bytes.as_slice())
+                .push_bind(created_at)
+                .push_bind(channel_id)
+                .push_bind(kind as i32);
+        });
 
-    qb.push(" ON CONFLICT DO NOTHING");
+        qb.push(" ON CONFLICT DO NOTHING");
 
-    qb.build().execute(pool).await?;
+        qb.build().execute(&mut **tx).await?;
+    }
     Ok(())
 }
 
@@ -254,6 +271,7 @@ impl ReadSession {
     /// the degraded follow-up can only observe *more* than the proof-time
     /// snapshot, never less — fresher aux rows, the same failure semantics
     /// as a request that routed to the writer to begin with.
+    #[datastore_span(name = "read_session_query_events", system = "postgresql")]
     pub async fn query_events(&mut self, q: &EventQuery) -> Result<Vec<StoredEvent>> {
         let degraded = match &mut self.inner {
             ReadSessionInner::Replica { tx, writer } => {
@@ -651,7 +669,7 @@ impl Db {
     /// `buzz.created_at_floor` GUC — this is what makes the replica fence
     /// proof hold for every insert path that goes through this pool.
     pub async fn new(config: &DbConfig) -> Result<Self> {
-        let pool = Self::connect_pool(config, &config.database_url, true).await?;
+        let pool = Self::connect_pool(config, &config.database_url).await?;
         let read_max_connections = config
             .read_max_connections
             .unwrap_or(config.max_connections);
@@ -671,31 +689,39 @@ impl Db {
         })
     }
 
-    /// Connect one pool with the sizing knobs from `config`.
+    /// Connect the writer pool with all session-level safety premises.
     ///
-    /// `arm_floor_guard` sets the `buzz.created_at_floor` session GUC on
-    /// every connection, arming the deferred commit-time trigger from
-    /// migration 0021. Writer pools must arm it; replica pools are read-only
-    /// so the trigger never fires there.
-    async fn connect_pool(config: &DbConfig, url: &str, arm_floor_guard: bool) -> Result<PgPool> {
-        let mut options = PgPoolOptions::new()
+    /// SQLx stores one `after_connect` hook, so the floor guard and transaction
+    /// isolation assertion must remain in this single closure. Registering a
+    /// second hook replaces the first and silently disarms the floor trigger.
+    async fn connect_pool(config: &DbConfig, url: &str) -> Result<PgPool> {
+        let options = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
-            .idle_timeout(Duration::from_secs(config.idle_timeout_secs));
-        if arm_floor_guard {
-            options = options.after_connect(|conn, _meta| {
+            .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
+            .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     // `SET` cannot take bind parameters; `set_config` can.
                     sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
                         .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
-                        .execute(conn)
+                        .execute(&mut *conn)
                         .await?;
+                    let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    if isolation != "read committed" {
+                        return Err(sqlx::Error::Configuration(
+                            format!(
+                                "writer pool requires READ COMMITTED transaction isolation, got {isolation}"
+                            )
+                            .into(),
+                        ));
+                    }
                     Ok(())
                 })
             });
-        }
         Ok(options.connect(url).await?)
     }
 
@@ -720,8 +746,9 @@ impl Db {
     /// are dialed only on first acquire; the ~10-minute reaper never tops
     /// the pool back up, which is fine — routed reads re-fill it on demand.
     ///
-    /// No floor guard: replica sessions are read-only, the trigger never
-    /// fires there (see [`Db::connect_pool`]).
+    /// No floor guard or writer-isolation assertion: replica sessions are
+    /// read-only, so the commit-time trigger from migration 0021 never fires
+    /// here and the write fence that depends on READ COMMITTED is never reached.
     fn connect_read_pool(config: &DbConfig, url: &str, max_connections: u32) -> Result<PgPool> {
         Ok(PgPoolOptions::new()
             .max_connections(max_connections)
@@ -1011,6 +1038,7 @@ impl Db {
     }
 
     /// Run pending database migrations.
+    #[datastore_span(name = "migrate", system = "postgresql")]
     pub async fn migrate(&self) -> Result<()> {
         migration::run_migrations(&self.pool).await
     }
@@ -1018,6 +1046,16 @@ impl Db {
     /// Returns `true` if the database is reachable (used by readiness probes).
     pub async fn ping(&self) -> bool {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
+    }
+
+    /// Validate the minimum deletion fence catalog required by serving paths.
+    pub async fn validate_deletion_serving_catalog(&self) -> Result<()> {
+        self.deletion_store().validate_serving_catalog().await
+    }
+
+    /// Validate the exact live community-deletion tenant catalog for destruction.
+    pub async fn validate_deletion_catalog(&self) -> Result<()> {
+        self.deletion_store().validate_catalog().await
     }
 
     /// Returns pool utilisation stats for metrics emission.
@@ -1055,6 +1093,7 @@ impl Db {
     /// detached from the shared pool so a stable leader neither returns a locked
     /// session to other callers nor permanently consumes a pool slot. Dropping the
     /// guard closes the connection and releases the session-scoped lock.
+    #[datastore_span(name = "try_lock_usage_metrics", system = "postgresql")]
     pub async fn try_lock_usage_metrics(
         &self,
         lock_key: i64,
@@ -1075,6 +1114,7 @@ impl Db {
 
     /// List reports for the deployment-global read-only admin plane.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "admin_list_reports", system = "postgresql")]
     pub async fn admin_list_reports(
         &self,
         community_id: Option<Uuid>,
@@ -1101,6 +1141,7 @@ impl Db {
     }
 
     /// Fetch one report for the deployment-global read-only admin plane.
+    #[datastore_span(name = "admin_get_report", system = "postgresql")]
     pub async fn admin_get_report(
         &self,
         id: Uuid,
@@ -1109,6 +1150,7 @@ impl Db {
     }
 
     /// List feedback for the deployment-global read-only admin plane.
+    #[datastore_span(name = "admin_list_feedback", system = "postgresql")]
     pub async fn admin_list_feedback(
         &self,
         limit: i64,
@@ -1117,6 +1159,7 @@ impl Db {
     }
 
     /// Fetch one feedback submission for the deployment-global admin plane.
+    #[datastore_span(name = "admin_get_feedback", system = "postgresql")]
     pub async fn admin_get_feedback(
         &self,
         id: Uuid,
@@ -1125,36 +1168,43 @@ impl Db {
     }
 
     /// Return total number of communities on this relay.
+    #[datastore_span(name = "usage_community_count", system = "postgresql")]
     pub async fn usage_community_count(&self) -> Result<i64> {
         usage::community_count(&self.pool).await
     }
 
     /// Return per-community user counts split by human/agent.
+    #[datastore_span(name = "usage_user_counts", system = "postgresql")]
     pub async fn usage_user_counts(&self) -> Result<Vec<usage::CommunityUserCounts>> {
         usage::user_counts(&self.pool).await
     }
 
     /// Return per-community channel counts by type.
+    #[datastore_span(name = "usage_channel_counts", system = "postgresql")]
     pub async fn usage_channel_counts(&self) -> Result<Vec<usage::CommunityChannelCount>> {
         usage::channel_counts(&self.pool).await
     }
 
     /// Return per-community kind=9 message counts.
+    #[datastore_span(name = "usage_message_counts", system = "postgresql")]
     pub async fn usage_message_counts(&self) -> Result<Vec<usage::CommunityMessageCount>> {
         usage::message_counts(&self.pool).await
     }
 
     /// Return per-community relay-member counts by role.
+    #[datastore_span(name = "usage_relay_member_counts", system = "postgresql")]
     pub async fn usage_relay_member_counts(&self) -> Result<Vec<usage::CommunityMemberCount>> {
         usage::relay_member_counts(&self.pool).await
     }
 
     /// Return per-community workflow counts by status.
+    #[datastore_span(name = "usage_workflow_counts", system = "postgresql")]
     pub async fn usage_workflow_counts(&self) -> Result<Vec<usage::CommunityWorkflowCount>> {
         usage::workflow_counts(&self.pool).await
     }
 
     /// Return per-community git-repo counts.
+    #[datastore_span(name = "usage_git_repo_counts", system = "postgresql")]
     pub async fn usage_git_repo_counts(&self) -> Result<Vec<usage::CommunityGitRepoCount>> {
         usage::git_repo_counts(&self.pool).await
     }
@@ -1162,6 +1212,7 @@ impl Db {
     /// Return per-community distinct active-user counts for a given SQL interval.
     ///
     /// `interval_sql` must be a trusted literal such as `"1 day"` or `"7 days"`.
+    #[datastore_span(name = "usage_active_user_counts", system = "postgresql")]
     pub async fn usage_active_user_counts(
         &self,
         interval_sql: &'static str,
@@ -1170,6 +1221,7 @@ impl Db {
     }
 
     /// Return per-community active-channel counts for a given SQL interval.
+    #[datastore_span(name = "usage_active_channel_counts", system = "postgresql")]
     pub async fn usage_active_channel_counts(
         &self,
         interval_sql: &'static str,
@@ -1178,8 +1230,14 @@ impl Db {
     }
 
     /// Return all community id → host mappings.
+    #[datastore_span(name = "usage_community_hosts", system = "postgresql")]
     pub async fn usage_community_hosts(&self) -> Result<Vec<usage::CommunityHost>> {
         usage::community_hosts(&self.pool).await
+    }
+
+    /// Return the shared durable whole-community deletion adapter.
+    pub fn deletion_store(&self) -> deletion::DeletionStore {
+        deletion::DeletionStore::new(self.pool.clone())
     }
 
     /// Begin a database transaction for atomic multi-statement operations.
@@ -1194,6 +1252,7 @@ impl Db {
     ///
     /// The caller owns host normalization and turns `None` into the fail-closed
     /// request/connection error. buzz-db only reads the durable host map.
+    #[datastore_span(name = "lookup_community_by_host", system = "postgresql")]
     pub async fn lookup_community_by_host(
         &self,
         normalized_host: &str,
@@ -1204,6 +1263,8 @@ impl Db {
             FROM communities
             WHERE lower(host) = lower($1)
               AND archived_at IS NULL
+              AND deleted_at IS NULL
+              AND deletion_state = 'active'
             "#,
         )
         .bind(normalized_host)
@@ -1223,9 +1284,10 @@ impl Db {
     }
 
     /// Returns whether a community id still exists in the active lifecycle state.
+    #[datastore_span(name = "is_community_active", system = "postgresql")]
     pub async fn is_community_active(&self, community_id: CommunityId) -> Result<bool> {
         let active = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL AND deleted_at IS NULL AND deletion_state = 'active')",
         )
         .bind(community_id.as_uuid())
         .fetch_one(&self.pool)
@@ -1234,6 +1296,10 @@ impl Db {
     }
 
     /// Returns a community by host regardless of lifecycle state. Operator-plane only.
+    #[datastore_span(
+        name = "lookup_community_by_host_for_management",
+        system = "postgresql"
+    )]
     pub async fn lookup_community_by_host_for_management(
         &self,
         normalized_host: &str,
@@ -1255,6 +1321,7 @@ impl Db {
     ///
     /// This is an operator-plane helper, not a tenant-scoped data-plane read:
     /// callers must gate it on deployment-level operator auth before exposing it.
+    #[datastore_span(name = "list_communities_owned_by", system = "postgresql")]
     pub async fn list_communities_owned_by(
         &self,
         owner_pubkey: &str,
@@ -1300,6 +1367,7 @@ impl Db {
     /// fan out under *that* community rather than the deployment default. The
     /// community is authoritative; the host is read back for labelling only and
     /// is never used to re-derive the community.
+    #[datastore_span(name = "lookup_community_host", system = "postgresql")]
     pub async fn lookup_community_host(&self, community_id: CommunityId) -> Result<Option<String>> {
         let row = sqlx::query(
             r#"
@@ -1307,6 +1375,8 @@ impl Db {
             FROM communities
             WHERE id = $1
               AND archived_at IS NULL
+              AND deleted_at IS NULL
+              AND deletion_state = 'active'
             "#,
         )
         .bind(community_id.as_uuid())
@@ -1324,6 +1394,7 @@ impl Db {
     ///
     /// Set by relay admins/owners via the kind:9033 command; the value is
     /// validated and size-capped at that write path.
+    #[datastore_span(name = "get_community_icon", system = "postgresql")]
     pub async fn get_community_icon(&self, community_id: CommunityId) -> Result<Option<String>> {
         let row = sqlx::query(
             r#"
@@ -1344,6 +1415,7 @@ impl Db {
     }
 
     /// Sets or clears (`None`) the community's workspace icon.
+    #[datastore_span(name = "set_community_icon", system = "postgresql")]
     pub async fn set_community_icon(
         &self,
         community_id: CommunityId,
@@ -1368,6 +1440,7 @@ impl Db {
     /// This is the startup/config seeding path for N=1 deployments. Migrations
     /// create the schema only; deployment-specific hosts are not hardcoded into
     /// schema history.
+    #[datastore_span(name = "ensure_configured_community", system = "postgresql")]
     pub async fn ensure_configured_community(
         &self,
         normalized_host: &str,
@@ -1377,12 +1450,19 @@ impl Db {
             INSERT INTO communities (host)
             VALUES ($1)
             ON CONFLICT (lower(host)) DO UPDATE SET host = communities.host
+            WHERE communities.deletion_state = 'active'
+              AND communities.deleted_at IS NULL
             RETURNING id, host, (xmax = 0) AS created
             "#,
         )
         .bind(normalized_host)
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            DbError::AccessDenied(format!(
+                "community host {normalized_host:?} is permanently tombstoned"
+            ))
+        })?;
 
         let id: Uuid = row.try_get("id")?;
         let host: String = row.try_get("host")?;
@@ -1400,6 +1480,7 @@ impl Db {
     /// Holds a per-owner advisory lock while enforcing the ownership limit.
     /// Identical create retries return the original record; host collisions and
     /// limit failures remain distinguishable to the operator API.
+    #[datastore_span(name = "create_community_with_owner", system = "postgresql")]
     pub async fn create_community_with_owner(
         &self,
         normalized_host: &str,
@@ -1462,6 +1543,8 @@ impl Db {
                   AND lower(rm.pubkey) = lower($2)
                   AND rm.role = 'owner'
                   AND c.archived_at IS NULL
+                  AND c.deletion_state = 'active'
+                  AND c.deleted_at IS NULL
                 "#,
             )
             .bind(normalized_host)
@@ -1485,6 +1568,7 @@ impl Db {
     }
 
     /// Idempotently archives a community when the asserted pubkey is its current owner.
+    #[datastore_span(name = "archive_community_owned_by", system = "postgresql")]
     pub async fn archive_community_owned_by(
         &self,
         normalized_host: &str,
@@ -1500,6 +1584,8 @@ impl Db {
                  AND lower(rm.pubkey) = lower($2)
                  AND rm.role = 'owner'
                  AND lower(c.host) <> lower($3)
+                 AND c.deletion_state = 'active'
+                 AND c.deleted_at IS NULL
                RETURNING c.id, c.host, c.archived_at"#,
         )
         .bind(normalized_host)
@@ -1518,6 +1604,7 @@ impl Db {
     }
 
     /// Idempotently restores a community when the asserted pubkey is its current owner.
+    #[datastore_span(name = "unarchive_community_owned_by", system = "postgresql")]
     pub async fn unarchive_community_owned_by(
         &self,
         normalized_host: &str,
@@ -1531,6 +1618,8 @@ impl Db {
                  AND rm.community_id = c.id
                  AND lower(rm.pubkey) = lower($2)
                  AND rm.role = 'owner'
+                 AND c.deletion_state = 'active'
+                 AND c.deleted_at IS NULL
                RETURNING c.id, c.host"#,
         )
         .bind(normalized_host)
@@ -1550,6 +1639,7 @@ impl Db {
     ///
     /// Internal relay producers use this to derive tenant context from the row
     /// they are acting on, rather than falling back to an implicit default.
+    #[datastore_span(name = "community_of_channel", system = "postgresql")]
     pub async fn community_of_channel(&self, channel_id: Uuid) -> Result<Option<CommunityId>> {
         let row = sqlx::query(
             r#"
@@ -1588,6 +1678,7 @@ impl Db {
     /// are intentionally not present rather than mapped to a default —
     /// callers MUST treat "channel-id not in map" as a coverage breach,
     /// never as "use the resolved community".
+    #[datastore_span(name = "communities_of_channels", system = "postgresql")]
     pub async fn communities_of_channels(
         &self,
         channel_ids: &[Uuid],
@@ -1617,6 +1708,7 @@ impl Db {
     }
 
     /// Inserts an event. Returns `(StoredEvent, was_inserted)` — `false` on duplicate.
+    #[datastore_span(name = "insert_event", system = "postgresql")]
     pub async fn insert_event(
         &self,
         community_id: CommunityId,
@@ -1632,6 +1724,49 @@ impl Db {
         Ok(result)
     }
 
+    /// Insert an event while holding and validating an admitted serving-write
+    /// lease under the community ordering lock through commit.
+    ///
+    /// External side effects use a durable lease rather than one long-lived DB
+    /// transaction. Their final database mutation presents that exact lease so
+    /// it may finish during quiescing without admitting any new serving work.
+    pub async fn insert_event_with_serving_write_guard(
+        &self,
+        lease: &deletion::ServingWriteLease,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+    ) -> Result<(StoredEvent, bool)> {
+        let community_id = lease.community_id;
+        let kind_u16 = event.kind.as_u16();
+        let kind_u32 = u32::from(kind_u16);
+        if kind_u32 == buzz_core::kind::KIND_AUTH {
+            return Err(DbError::AuthEventRejected);
+        }
+        if buzz_core::kind::is_ephemeral(kind_u32) {
+            return Err(DbError::EphemeralEventRejected(kind_u16));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        self.deletion_store()
+            .guard_transaction_with_serving_lease(&mut tx, lease)
+            .await?;
+        let result = event::insert_event_with_thread_metadata_tx(
+            &mut tx,
+            community_id,
+            event,
+            channel_id,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        if result.1 {
+            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
+                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
+            }
+        }
+        Ok(result)
+    }
+
     /// Queries events matching the given filter parameters.
     ///
     /// Always reads from the WRITER pool. If the result influences a write
@@ -1639,6 +1774,7 @@ impl Db {
     /// callers that tolerate bounded staleness should use
     /// [`Db::query_events_routed`] instead — converting a caller is an
     /// explicit, per-callsite decision, never a change to this method.
+    #[datastore_span(name = "query_events", system = "postgresql")]
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<StoredEvent>> {
         event::query_events(&self.pool, q).await
     }
@@ -1659,6 +1795,7 @@ impl Db {
     /// unset, even covered-eligible queries stay on the writer, so merging
     /// this seam is a true no-op until the budget is configured. Every
     /// failure fails closed to the writer.
+    #[datastore_span(name = "query_events_routed", system = "postgresql")]
     pub async fn query_events_routed(
         &self,
         path: &'static str,
@@ -1693,6 +1830,7 @@ impl Db {
     /// display page absorbs that per-row; a number derived from the rows
     /// does not. Same classification-table requirement as
     /// [`Db::query_events_routed`].
+    #[datastore_span(name = "query_events_routed_bounded", system = "postgresql")]
     pub async fn query_events_routed_bounded(
         &self,
         path: &'static str,
@@ -1720,6 +1858,7 @@ impl Db {
     ///
     /// Always reads from the WRITER pool — see [`Db::query_events`] for the
     /// writer-vs-routed rule.
+    #[datastore_span(name = "count_events", system = "postgresql")]
     pub async fn count_events(&self, q: &EventQuery) -> Result<i64> {
         event::count_events(&self.pool, q).await
     }
@@ -1734,6 +1873,7 @@ impl Db {
     /// inflated number for up to `FENCE_STALENESS` is a different product
     /// statement than a page briefly showing a deleted row. `Bounded` ties
     /// the error to the accepted budget `B`.
+    #[datastore_span(name = "count_events_routed", system = "postgresql")]
     pub async fn count_events_routed(&self, path: &'static str, q: &EventQuery) -> Result<i64> {
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
@@ -1755,6 +1895,7 @@ impl Db {
 
     /// Return whether a creator-signed huddle-start event links a parent
     /// channel to an ephemeral huddle channel.
+    #[datastore_span(name = "huddle_started_link_exists", system = "postgresql")]
     pub async fn huddle_started_link_exists(
         &self,
         community_id: CommunityId,
@@ -1777,6 +1918,7 @@ impl Db {
     /// Uses canonical NIP-16 ordering: `created_at DESC, id ASC`.
     /// This matches the write path in [`replace_addressable_event`] and handles
     /// historical duplicate survivors correctly.
+    #[datastore_span(name = "get_latest_global_replaceable", system = "postgresql")]
     pub async fn get_latest_global_replaceable(
         &self,
         community_id: CommunityId,
@@ -1789,6 +1931,7 @@ impl Db {
     /// Fetches a single non-deleted event by its raw ID bytes.
     ///
     /// Returns `None` if the event does not exist or has been soft-deleted.
+    #[datastore_span(name = "get_event_by_id", system = "postgresql")]
     pub async fn get_event_by_id(
         &self,
         community_id: CommunityId,
@@ -1798,6 +1941,7 @@ impl Db {
     }
 
     /// Fetches a single event by its raw ID bytes, **including soft-deleted rows**.
+    #[datastore_span(name = "get_event_by_id_including_deleted", system = "postgresql")]
     pub async fn get_event_by_id_including_deleted(
         &self,
         community_id: CommunityId,
@@ -1807,6 +1951,7 @@ impl Db {
     }
 
     /// Soft-deletes an event. Returns `Ok(true)` if deleted, `Ok(false)` if already deleted.
+    #[datastore_span(name = "soft_delete_event", system = "postgresql")]
     pub async fn soft_delete_event(
         &self,
         community_id: CommunityId,
@@ -1819,6 +1964,7 @@ impl Db {
     /// when it is not newer than the deletion request.
     /// Used by NIP-09 a-tag deletion for parameterized-replaceable kinds;
     /// `deletion_created_at_secs` is the deletion event's `created_at`.
+    #[datastore_span(name = "soft_delete_by_coordinate", system = "postgresql")]
     pub async fn soft_delete_by_coordinate(
         &self,
         community_id: CommunityId,
@@ -1839,6 +1985,7 @@ impl Db {
     }
 
     /// Atomically soft-delete an event and decrement thread reply counters.
+    #[datastore_span(name = "soft_delete_event_and_update_thread", system = "postgresql")]
     pub async fn soft_delete_event_and_update_thread(
         &self,
         community_id: CommunityId,
@@ -1857,6 +2004,7 @@ impl Db {
     }
 
     /// Returns the most recent `created_at` for a channel.
+    #[datastore_span(name = "get_last_message_at", system = "postgresql")]
     pub async fn get_last_message_at(
         &self,
         community_id: CommunityId,
@@ -1866,6 +2014,7 @@ impl Db {
     }
 
     /// Bulk-fetch the most recent `created_at` for a set of channel IDs.
+    #[datastore_span(name = "get_last_message_at_bulk", system = "postgresql")]
     pub async fn get_last_message_at_bulk(
         &self,
         community_id: CommunityId,
@@ -1875,6 +2024,7 @@ impl Db {
     }
 
     /// Batch-fetch non-deleted events by their raw IDs.
+    #[datastore_span(name = "get_events_by_ids", system = "postgresql")]
     pub async fn get_events_by_ids(
         &self,
         community_id: CommunityId,
@@ -1890,6 +2040,7 @@ impl Db {
     /// channel pin, so no fence floor can prove insert-completeness — the
     /// covered arm is structurally unavailable. Used for FTS hit hydration,
     /// where a missing row degrades to a skipped search hit downstream.
+    #[datastore_span(name = "get_events_by_ids_routed", system = "postgresql")]
     pub async fn get_events_by_ids_routed(
         &self,
         path: &'static str,
@@ -1915,6 +2066,7 @@ impl Db {
     }
 
     /// Exclusively claim a batch of due matcher jobs from one community.
+    #[datastore_span(name = "claim_due_push_match_batch", system = "postgresql")]
     pub async fn claim_due_push_match_batch(
         &self,
         limit: i64,
@@ -1924,6 +2076,7 @@ impl Db {
     }
 
     /// Load active endpoint-enabled leases eligible for push matching.
+    #[datastore_span(name = "active_push_match_leases", system = "postgresql")]
     pub async fn active_push_match_leases(
         &self,
         community: CommunityId,
@@ -1932,6 +2085,7 @@ impl Db {
     }
 
     /// Complete matcher jobs from one claimed batch while the fence holds.
+    #[datastore_span(name = "complete_push_match_batch", system = "postgresql")]
     pub async fn complete_push_match_batch(
         &self,
         community: CommunityId,
@@ -1942,6 +2096,7 @@ impl Db {
     }
 
     /// Release fenced matcher claims from one batch for retry.
+    #[datastore_span(name = "retry_push_match_batch", system = "postgresql")]
     pub async fn retry_push_match_batch(
         &self,
         community: CommunityId,
@@ -1953,11 +2108,13 @@ impl Db {
     }
 
     /// Delete exhausted matcher jobs (periodic sweep, off the claim path).
+    #[datastore_span(name = "reap_exhausted_push_matches", system = "postgresql")]
     pub async fn reap_exhausted_push_matches(&self) -> Result<u64> {
         push::reap_exhausted_matches(&self.pool).await
     }
 
     /// Idempotently enqueue a wake for a matched lease and event.
+    #[datastore_span(name = "enqueue_push_wake", system = "postgresql")]
     pub async fn enqueue_push_wake(
         &self,
         community: CommunityId,
@@ -1969,6 +2126,7 @@ impl Db {
     }
 
     /// Set-wise [`Self::enqueue_push_wake`]: one transaction per batch.
+    #[datastore_span(name = "enqueue_push_wakes", system = "postgresql")]
     pub async fn enqueue_push_wakes(
         &self,
         community: CommunityId,
@@ -1978,6 +2136,7 @@ impl Db {
     }
 
     /// Exclusively claim due wake jobs for one community.
+    #[datastore_span(name = "claim_due_push_wakes", system = "postgresql")]
     pub async fn claim_due_push_wakes(
         &self,
         community: CommunityId,
@@ -1988,6 +2147,7 @@ impl Db {
     }
 
     /// Revalidate a wake's claim, source event, and current lease before send.
+    #[datastore_span(name = "revalidate_push_wake", system = "postgresql")]
     pub async fn revalidate_push_wake(
         &self,
         community: CommunityId,
@@ -1998,6 +2158,7 @@ impl Db {
     }
 
     /// Mark a fenced wake claim delivered.
+    #[datastore_span(name = "complete_push_wake", system = "postgresql")]
     pub async fn complete_push_wake(
         &self,
         community: CommunityId,
@@ -2008,6 +2169,7 @@ impl Db {
     }
 
     /// Release a fenced wake claim for retry at the supplied time.
+    #[datastore_span(name = "retry_push_wake", system = "postgresql")]
     pub async fn retry_push_wake(
         &self,
         community: CommunityId,
@@ -2019,6 +2181,7 @@ impl Db {
     }
 
     /// Mark a fenced wake claim terminally failed.
+    #[datastore_span(name = "fail_push_wake", system = "postgresql")]
     pub async fn fail_push_wake(
         &self,
         community: CommunityId,
@@ -2029,6 +2192,7 @@ impl Db {
     }
 
     /// Disable an endpoint only if the specified lease generation is current.
+    #[datastore_span(name = "disable_push_endpoint", system = "postgresql")]
     pub async fn disable_push_endpoint(
         &self,
         community: CommunityId,
@@ -2048,6 +2212,7 @@ impl Db {
 
     /// Atomically persist a validated kind:30350 event and its effective lease.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "accept_push_lease_event", system = "postgresql")]
     pub async fn accept_push_lease_event(
         &self,
         community: CommunityId,
@@ -2070,6 +2235,7 @@ impl Db {
     }
 
     /// Atomically insert an event AND its thread metadata in a single transaction.
+    #[datastore_span(name = "insert_event_with_thread_metadata", system = "postgresql")]
     pub async fn insert_event_with_thread_metadata(
         &self,
         community_id: CommunityId,
@@ -2095,6 +2261,10 @@ impl Db {
 
     /// Atomically insert a kind:7 reaction event and its reaction row.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(
+        name = "insert_reaction_event_with_thread_metadata",
+        system = "postgresql"
+    )]
     pub async fn insert_reaction_event_with_thread_metadata(
         &self,
         community_id: CommunityId,
@@ -2129,6 +2299,7 @@ impl Db {
 
     /// Creates a new channel, bootstraps the creator as owner, and returns the record.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "create_channel", system = "postgresql")]
     pub async fn create_channel(
         &self,
         community_id: CommunityId,
@@ -2156,6 +2327,7 @@ impl Db {
     ///
     /// Returns `(record, true)` if newly created, `(record, false)` if already exists.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "create_channel_with_id", system = "postgresql")]
     pub async fn create_channel_with_id(
         &self,
         community_id: CommunityId,
@@ -2182,6 +2354,7 @@ impl Db {
     }
 
     /// Fetches a channel record by ID.
+    #[datastore_span(name = "get_channel", system = "postgresql")]
     pub async fn get_channel(
         &self,
         community_id: CommunityId,
@@ -2191,6 +2364,7 @@ impl Db {
     }
 
     /// Returns the canvas content for a channel, if any.
+    #[datastore_span(name = "get_canvas", system = "postgresql")]
     pub async fn get_canvas(
         &self,
         community_id: CommunityId,
@@ -2200,6 +2374,7 @@ impl Db {
     }
 
     /// Sets or clears the canvas content for a channel.
+    #[datastore_span(name = "set_canvas", system = "postgresql")]
     pub async fn set_canvas(
         &self,
         community_id: CommunityId,
@@ -2209,7 +2384,26 @@ impl Db {
         channel::set_canvas(&self.pool, community_id, channel_id, canvas).await
     }
 
+    /// Verify the mixed-version channel-roster database fence end to end.
+    #[datastore_span(name = "verify_channel_roster_fence", system = "postgresql")]
+    pub async fn verify_channel_roster_fence(&self) -> Result<()> {
+        channel::verify_channel_roster_fence_catalog(&self.pool).await?;
+        channel::verify_channel_roster_fence_behavior(&self.pool).await
+    }
+
+    /// Capture the active roster while holding the membership-writer lock.
+    #[datastore_span(name = "lock_member_snapshot", system = "postgresql")]
+    pub async fn lock_member_snapshot(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        relay_pubkey: &[u8],
+    ) -> Result<channel::LockedMemberSnapshot> {
+        channel::lock_member_snapshot(&self.pool, community_id, channel_id, relay_pubkey).await
+    }
+
     /// Adds a member to a channel.
+    #[datastore_span(name = "add_member", system = "postgresql")]
     pub async fn add_member(
         &self,
         community_id: CommunityId,
@@ -2230,6 +2424,7 @@ impl Db {
     }
 
     /// Removes a member from a channel.
+    #[datastore_span(name = "remove_member", system = "postgresql")]
     pub async fn remove_member(
         &self,
         community_id: CommunityId,
@@ -2241,6 +2436,7 @@ impl Db {
     }
 
     /// Returns `true` if the pubkey is an active member.
+    #[datastore_span(name = "is_member", system = "postgresql")]
     pub async fn is_member(
         &self,
         community_id: CommunityId,
@@ -2252,6 +2448,7 @@ impl Db {
 
     /// Return the active (channel, pubkey) membership pairs among the given
     /// sets, in one statement.
+    #[datastore_span(name = "membership_pairs", system = "postgresql")]
     pub async fn membership_pairs(
         &self,
         community_id: CommunityId,
@@ -2262,6 +2459,7 @@ impl Db {
     }
 
     /// Returns all active members of a channel.
+    #[datastore_span(name = "get_members", system = "postgresql")]
     pub async fn get_members(
         &self,
         community_id: CommunityId,
@@ -2271,6 +2469,7 @@ impl Db {
     }
 
     /// Returns active members for multiple channels in a single query.
+    #[datastore_span(name = "get_members_bulk", system = "postgresql")]
     pub async fn get_members_bulk(
         &self,
         community_id: CommunityId,
@@ -2280,6 +2479,7 @@ impl Db {
     }
 
     /// Get all channel IDs accessible to a pubkey.
+    #[datastore_span(name = "get_accessible_channel_ids", system = "postgresql")]
     pub async fn get_accessible_channel_ids(
         &self,
         community_id: CommunityId,
@@ -2288,7 +2488,26 @@ impl Db {
         channel::get_accessible_channel_ids(&self.pool, community_id, pubkey).await
     }
 
+    /// Returns large active-channel rosters whose relay-authored snapshots differ.
+    #[datastore_span(
+        name = "list_large_channel_rosters_needing_reconciliation",
+        system = "postgresql"
+    )]
+    pub async fn list_large_channel_rosters_needing_reconciliation(
+        &self,
+        minimum_members: i64,
+        relay_pubkey: &[u8],
+    ) -> Result<Vec<channel::LargeChannelRoster>> {
+        channel::list_large_channel_rosters_needing_reconciliation(
+            &self.pool,
+            minimum_members,
+            relay_pubkey,
+        )
+        .await
+    }
+
     /// Lists channels, optionally filtered by visibility.
+    #[datastore_span(name = "list_channels", system = "postgresql")]
     pub async fn list_channels(
         &self,
         community_id: CommunityId,
@@ -2298,6 +2517,7 @@ impl Db {
     }
 
     /// Returns full channel records for all channels a user can access.
+    #[datastore_span(name = "get_accessible_channels", system = "postgresql")]
     pub async fn get_accessible_channels(
         &self,
         community_id: CommunityId,
@@ -2316,6 +2536,7 @@ impl Db {
     }
 
     /// Returns all bot-role members with their aggregated channel names in one community.
+    #[datastore_span(name = "get_bot_members", system = "postgresql")]
     pub async fn get_bot_members(
         &self,
         community_id: CommunityId,
@@ -2324,6 +2545,7 @@ impl Db {
     }
 
     /// Bulk-fetch user records by pubkey.
+    #[datastore_span(name = "get_users_bulk", system = "postgresql")]
     pub async fn get_users_bulk(
         &self,
         community_id: CommunityId,
@@ -2333,6 +2555,7 @@ impl Db {
     }
 
     /// Updates a channel's name and/or description.
+    #[datastore_span(name = "update_channel", system = "postgresql")]
     pub async fn update_channel(
         &self,
         community_id: CommunityId,
@@ -2343,6 +2566,7 @@ impl Db {
     }
 
     /// Sets the topic for a channel.
+    #[datastore_span(name = "set_topic", system = "postgresql")]
     pub async fn set_topic(
         &self,
         community_id: CommunityId,
@@ -2354,6 +2578,7 @@ impl Db {
     }
 
     /// Sets the purpose for a channel.
+    #[datastore_span(name = "set_purpose", system = "postgresql")]
     pub async fn set_purpose(
         &self,
         community_id: CommunityId,
@@ -2365,11 +2590,13 @@ impl Db {
     }
 
     /// Archives a channel.
+    #[datastore_span(name = "archive_channel", system = "postgresql")]
     pub async fn archive_channel(&self, community_id: CommunityId, channel_id: Uuid) -> Result<()> {
         channel::archive_channel(&self.pool, community_id, channel_id).await
     }
 
     /// Unarchives a channel.
+    #[datastore_span(name = "unarchive_channel", system = "postgresql")]
     pub async fn unarchive_channel(
         &self,
         community_id: CommunityId,
@@ -2379,6 +2606,7 @@ impl Db {
     }
 
     /// Soft-delete a channel.
+    #[datastore_span(name = "soft_delete_channel", system = "postgresql")]
     pub async fn soft_delete_channel(
         &self,
         community_id: CommunityId,
@@ -2388,6 +2616,7 @@ impl Db {
     }
 
     /// Returns the count of active members in a channel.
+    #[datastore_span(name = "get_member_count", system = "postgresql")]
     pub async fn get_member_count(
         &self,
         community_id: CommunityId,
@@ -2397,6 +2626,7 @@ impl Db {
     }
 
     /// Bulk-fetch member counts for a set of channel IDs.
+    #[datastore_span(name = "get_member_counts_bulk", system = "postgresql")]
     pub async fn get_member_counts_bulk(
         &self,
         community_id: CommunityId,
@@ -2406,6 +2636,7 @@ impl Db {
     }
 
     /// Get the active role of a pubkey in a channel.
+    #[datastore_span(name = "get_member_role", system = "postgresql")]
     pub async fn get_member_role(
         &self,
         community_id: CommunityId,
@@ -2416,6 +2647,7 @@ impl Db {
     }
 
     /// Archive ephemeral channels whose TTL deadline has passed.
+    #[datastore_span(name = "reap_expired_ephemeral_channels", system = "postgresql")]
     pub async fn reap_expired_ephemeral_channels(
         &self,
     ) -> Result<Vec<channel::ReapedEphemeralChannel>> {
@@ -2423,6 +2655,7 @@ impl Db {
     }
 
     /// Query due reminders ready for delivery.
+    #[datastore_span(name = "query_due_reminders", system = "postgresql")]
     pub async fn query_due_reminders(
         &self,
         now_secs: i64,
@@ -2432,6 +2665,7 @@ impl Db {
     }
 
     /// Atomically claim a due reminder for delivery (cross-pod dedup).
+    #[datastore_span(name = "claim_due_reminder", system = "postgresql")]
     pub async fn claim_due_reminder(
         &self,
         community_id: CommunityId,
@@ -2442,6 +2676,7 @@ impl Db {
     }
 
     /// Atomically claim a due reminder using a caller-supplied delivery stamp.
+    #[datastore_span(name = "claim_due_reminder_with_stamp", system = "postgresql")]
     pub async fn claim_due_reminder_with_stamp(
         &self,
         community_id: CommunityId,
@@ -2460,6 +2695,7 @@ impl Db {
     }
 
     /// Release a claimed due reminder after a publish failure.
+    #[datastore_span(name = "release_due_reminder", system = "postgresql")]
     pub async fn release_due_reminder(
         &self,
         community_id: CommunityId,
@@ -2482,11 +2718,13 @@ impl Db {
     /// Returns `true` if a new row was inserted (first time), `false` if it
     /// already existed. Callers use the `true` return to increment
     /// `buzz_users_created_total`.
+    #[datastore_span(name = "ensure_user", system = "postgresql")]
     pub async fn ensure_user(&self, community_id: CommunityId, pubkey: &[u8]) -> Result<bool> {
         user::ensure_user(&self.pool, community_id, pubkey).await
     }
 
     /// Get a single user record by pubkey.
+    #[datastore_span(name = "get_user", system = "postgresql")]
     pub async fn get_user(
         &self,
         community_id: CommunityId,
@@ -2496,6 +2734,7 @@ impl Db {
     }
 
     /// Update a user's profile fields.
+    #[datastore_span(name = "update_user_profile", system = "postgresql")]
     pub async fn update_user_profile(
         &self,
         community_id: CommunityId,
@@ -2518,6 +2757,7 @@ impl Db {
     }
 
     /// Look up a user by NIP-05 handle.
+    #[datastore_span(name = "get_user_by_nip05", system = "postgresql")]
     pub async fn get_user_by_nip05(
         &self,
         community_id: CommunityId,
@@ -2528,6 +2768,7 @@ impl Db {
     }
 
     /// Search users by display name, NIP-05 handle, or pubkey prefix.
+    #[datastore_span(name = "search_users", system = "postgresql")]
     pub async fn search_users(
         &self,
         community_id: CommunityId,
@@ -2539,6 +2780,7 @@ impl Db {
 
     /// Atomically set agent owner — only if no owner is currently assigned.
     /// Returns Ok(true) if set, Ok(false) if an owner already exists.
+    #[datastore_span(name = "set_agent_owner", system = "postgresql")]
     pub async fn set_agent_owner(
         &self,
         community_id: CommunityId,
@@ -2549,6 +2791,7 @@ impl Db {
     }
 
     /// Get the channel_add_policy and agent_owner_pubkey for a user.
+    #[datastore_span(name = "get_agent_channel_policy", system = "postgresql")]
     pub async fn get_agent_channel_policy(
         &self,
         community_id: CommunityId,
@@ -2558,6 +2801,7 @@ impl Db {
     }
 
     /// Check whether `actor_pubkey` is the agent owner of `target_pubkey`.
+    #[datastore_span(name = "is_agent_owner", system = "postgresql")]
     pub async fn is_agent_owner(
         &self,
         community_id: CommunityId,
@@ -2568,6 +2812,7 @@ impl Db {
     }
 
     /// Set the channel_add_policy for a user.
+    #[datastore_span(name = "set_channel_add_policy", system = "postgresql")]
     pub async fn set_channel_add_policy(
         &self,
         community_id: CommunityId,
@@ -2578,6 +2823,7 @@ impl Db {
     }
 
     /// Find an existing DM by its participant hash.
+    #[datastore_span(name = "find_dm_by_participants", system = "postgresql")]
     pub async fn find_dm_by_participants(
         &self,
         community_id: CommunityId,
@@ -2587,6 +2833,7 @@ impl Db {
     }
 
     /// Create or return an existing DM channel.
+    #[datastore_span(name = "create_dm", system = "postgresql")]
     pub async fn create_dm(
         &self,
         community_id: CommunityId,
@@ -2597,6 +2844,7 @@ impl Db {
     }
 
     /// List all DMs for a user.
+    #[datastore_span(name = "list_dms_for_user", system = "postgresql")]
     pub async fn list_dms_for_user(
         &self,
         community_id: CommunityId,
@@ -2608,6 +2856,7 @@ impl Db {
     }
 
     /// Open or retrieve a DM for the given participants.
+    #[datastore_span(name = "open_dm", system = "postgresql")]
     pub async fn open_dm(
         &self,
         community_id: CommunityId,
@@ -2621,6 +2870,7 @@ impl Db {
     ///
     /// The DM is not deleted — it can be restored by opening a new DM with
     /// the same participants.
+    #[datastore_span(name = "hide_dm", system = "postgresql")]
     pub async fn hide_dm(
         &self,
         community_id: CommunityId,
@@ -2631,6 +2881,7 @@ impl Db {
     }
 
     /// Unhide a DM channel for a specific user.
+    #[datastore_span(name = "unhide_dm", system = "postgresql")]
     pub async fn unhide_dm(
         &self,
         community_id: CommunityId,
@@ -2641,6 +2892,7 @@ impl Db {
     }
 
     /// List the channel IDs of all DMs the given user currently has hidden.
+    #[datastore_span(name = "list_hidden_dms", system = "postgresql")]
     pub async fn list_hidden_dms(
         &self,
         community_id: CommunityId,
@@ -2651,6 +2903,7 @@ impl Db {
 
     /// Insert thread metadata.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "insert_thread_metadata", system = "postgresql")]
     pub async fn insert_thread_metadata(
         &self,
         community_id: CommunityId,
@@ -2701,6 +2954,7 @@ impl Db {
     /// A head fetch routed under Predicate A skips the re-run: bounded
     /// staleness (missing at most the freshest budget-window of replies) is
     /// exactly the semantic the head gate accepts.
+    #[datastore_span(name = "get_thread_replies", system = "postgresql")]
     pub async fn get_thread_replies(
         &self,
         community_id: CommunityId,
@@ -2775,6 +3029,7 @@ impl Db {
     }
 
     /// Fetch aggregated thread stats.
+    #[datastore_span(name = "get_thread_summary", system = "postgresql")]
     pub async fn get_thread_summary(
         &self,
         community_id: CommunityId,
@@ -2826,6 +3081,7 @@ impl Db {
     ///
     /// Every failure fails closed to the writer and is recorded in
     /// `buzz_db_route_decision`.
+    #[datastore_span(name = "get_channel_window", system = "postgresql")]
     pub async fn get_channel_window_with_session(
         &self,
         community_id: CommunityId,
@@ -2991,6 +3247,7 @@ impl Db {
     }
 
     /// Look up a single thread_metadata row by event_id.
+    #[datastore_span(name = "get_thread_metadata_by_event", system = "postgresql")]
     pub async fn get_thread_metadata_by_event(
         &self,
         community_id: CommunityId,
@@ -3000,6 +3257,7 @@ impl Db {
     }
 
     /// Decrement reply counts.
+    #[datastore_span(name = "decrement_reply_count", system = "postgresql")]
     pub async fn decrement_reply_count(
         &self,
         community_id: CommunityId,
@@ -3011,6 +3269,7 @@ impl Db {
     }
 
     /// Add (or re-activate) a reaction.
+    #[datastore_span(name = "add_reaction", system = "postgresql")]
     pub async fn add_reaction(
         &self,
         community: CommunityId,
@@ -3033,6 +3292,7 @@ impl Db {
     }
 
     /// Soft-delete a reaction.
+    #[datastore_span(name = "remove_reaction", system = "postgresql")]
     pub async fn remove_reaction(
         &self,
         community: CommunityId,
@@ -3053,6 +3313,7 @@ impl Db {
     }
 
     /// Soft-delete a reaction by its source event ID.
+    #[datastore_span(name = "remove_reaction_by_source_event_id", system = "postgresql")]
     pub async fn remove_reaction_by_source_event_id(
         &self,
         community: CommunityId,
@@ -3062,6 +3323,7 @@ impl Db {
     }
 
     /// Look up the active reaction row for one actor + emoji + target tuple.
+    #[datastore_span(name = "get_active_reaction_record", system = "postgresql")]
     pub async fn get_active_reaction_record(
         &self,
         community: CommunityId,
@@ -3082,6 +3344,7 @@ impl Db {
     }
 
     /// Backfill the source event ID on an active reaction row.
+    #[datastore_span(name = "set_reaction_event_id", system = "postgresql")]
     pub async fn set_reaction_event_id(
         &self,
         community: CommunityId,
@@ -3104,6 +3367,7 @@ impl Db {
     }
 
     /// Get all active reactions for an event, grouped by emoji.
+    #[datastore_span(name = "get_reactions", system = "postgresql")]
     pub async fn get_reactions(
         &self,
         community: CommunityId,
@@ -3124,6 +3388,7 @@ impl Db {
     }
 
     /// Batch-fetch emoji counts for a set of (event_id, event_created_at) pairs.
+    #[datastore_span(name = "get_reactions_bulk", system = "postgresql")]
     pub async fn get_reactions_bulk(
         &self,
         community: CommunityId,
@@ -3133,6 +3398,7 @@ impl Db {
     }
 
     /// Find events that @mention the given pubkey.
+    #[datastore_span(name = "query_feed_mentions", system = "postgresql")]
     pub async fn query_feed_mentions(
         &self,
         community: CommunityId,
@@ -3159,6 +3425,7 @@ impl Db {
     /// parameter admits community-global rows alongside channel rows, so no
     /// single channel's fence floor can prove completeness — the covered arm
     /// is structurally unavailable, not merely unchosen.
+    #[datastore_span(name = "query_feed_mentions_routed", system = "postgresql")]
     pub async fn query_feed_mentions_routed(
         &self,
         path: &'static str,
@@ -3214,6 +3481,7 @@ impl Db {
     }
 
     /// Find events that require action from the given pubkey.
+    #[datastore_span(name = "query_feed_needs_action", system = "postgresql")]
     pub async fn query_feed_needs_action(
         &self,
         community: CommunityId,
@@ -3236,6 +3504,7 @@ impl Db {
     /// [`Db::query_feed_needs_action`] with replica routing — BOUNDED arm
     /// only; see [`Db::query_feed_mentions_routed`] for why the covered arm
     /// is structurally unavailable to feed queries.
+    #[datastore_span(name = "query_feed_needs_action_routed", system = "postgresql")]
     pub async fn query_feed_needs_action_routed(
         &self,
         path: &'static str,
@@ -3291,6 +3560,7 @@ impl Db {
     }
 
     /// Find recent activity across accessible channels.
+    #[datastore_span(name = "query_feed_activity", system = "postgresql")]
     pub async fn query_feed_activity(
         &self,
         community: CommunityId,
@@ -3304,6 +3574,7 @@ impl Db {
     /// [`Db::query_feed_activity`] with replica routing — BOUNDED arm only;
     /// see [`Db::query_feed_mentions_routed`] for why the covered arm is
     /// structurally unavailable to feed queries.
+    #[datastore_span(name = "query_feed_activity_routed", system = "postgresql")]
     pub async fn query_feed_activity_routed(
         &self,
         path: &'static str,
@@ -3350,6 +3621,7 @@ impl Db {
 
     /// Create a new API token record.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "create_api_token", system = "postgresql")]
     pub async fn create_api_token(
         &self,
         community_id: CommunityId,
@@ -3375,6 +3647,7 @@ impl Db {
 
     /// Atomic conditional INSERT with 10-token limit (per (community, owner)).
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "create_api_token_if_under_limit", system = "postgresql")]
     pub async fn create_api_token_if_under_limit(
         &self,
         community_id: CommunityId,
@@ -3404,6 +3677,7 @@ impl Db {
     /// See [`api_token::get_api_token_by_hash_including_revoked`] for the
     /// row-44 conformance rationale — the `(community_id, token_hash)` key
     /// is enforced both by the storage UNIQUE index and by this WHERE clause.
+    #[datastore_span(name = "get_api_token_by_hash", system = "postgresql")]
     pub async fn get_api_token_by_hash(
         &self,
         community_id: CommunityId,
@@ -3429,6 +3703,10 @@ impl Db {
     }
 
     /// Look up an API token by hash, including revoked, scoped to community.
+    #[datastore_span(
+        name = "get_api_token_by_hash_including_revoked",
+        system = "postgresql"
+    )]
     pub async fn get_api_token_by_hash_including_revoked(
         &self,
         community_id: CommunityId,
@@ -3443,6 +3721,7 @@ impl Db {
     }
 
     /// Record a token usage (update `last_used_at`), scoped to community.
+    #[datastore_span(name = "touch_api_token", system = "postgresql")]
     pub async fn touch_api_token(&self, community_id: CommunityId, hash: &[u8]) -> Result<()> {
         sqlx::query(
             "UPDATE api_tokens SET last_used_at = NOW() WHERE community_id = $1 AND token_hash = $2",
@@ -3464,6 +3743,7 @@ impl Db {
     }
 
     /// List all active (non-revoked) tokens in a community, newest first.
+    #[datastore_span(name = "list_active_tokens", system = "postgresql")]
     pub async fn list_active_tokens(&self, community_id: CommunityId) -> Result<Vec<TokenSummary>> {
         let rows = sqlx::query(
             r#"
@@ -3498,6 +3778,7 @@ impl Db {
     }
 
     /// List all tokens for a (community, owner) pair (including revoked).
+    #[datastore_span(name = "list_tokens_by_owner", system = "postgresql")]
     pub async fn list_tokens_by_owner(
         &self,
         community_id: CommunityId,
@@ -3507,6 +3788,7 @@ impl Db {
     }
 
     /// Revoke a single token by ID, scoped to (community, owner).
+    #[datastore_span(name = "revoke_token", system = "postgresql")]
     pub async fn revoke_token(
         &self,
         community_id: CommunityId,
@@ -3525,6 +3807,7 @@ impl Db {
     }
 
     /// Revoke all active tokens for a (community, owner) pair.
+    #[datastore_span(name = "revoke_all_tokens", system = "postgresql")]
     pub async fn revoke_all_tokens(
         &self,
         community_id: CommunityId,
@@ -3541,6 +3824,7 @@ impl Db {
     }
 
     /// Create a new workflow.
+    #[datastore_span(name = "create_workflow", system = "postgresql")]
     pub async fn create_workflow(
         &self,
         community_id: CommunityId,
@@ -3564,6 +3848,7 @@ impl Db {
 
     /// Insert or update a workflow using its NIP-33 `d`-tag UUID.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "upsert_workflow", system = "postgresql")]
     pub async fn upsert_workflow(
         &self,
         community_id: CommunityId,
@@ -3588,6 +3873,7 @@ impl Db {
     }
 
     /// Fetch a single workflow by ID, scoped to its community.
+    #[datastore_span(name = "get_workflow", system = "postgresql")]
     pub async fn get_workflow(
         &self,
         community_id: CommunityId,
@@ -3597,6 +3883,7 @@ impl Db {
     }
 
     /// List workflows for a channel.
+    #[datastore_span(name = "list_channel_workflows", system = "postgresql")]
     pub async fn list_channel_workflows(
         &self,
         community_id: CommunityId,
@@ -3608,6 +3895,7 @@ impl Db {
     }
 
     /// List active, enabled workflows for a channel.
+    #[datastore_span(name = "list_enabled_channel_workflows", system = "postgresql")]
     pub async fn list_enabled_channel_workflows(
         &self,
         community_id: CommunityId,
@@ -3617,6 +3905,7 @@ impl Db {
     }
 
     /// List all active, enabled schedule-triggered workflows.
+    #[datastore_span(name = "list_all_enabled_workflows", system = "postgresql")]
     pub async fn list_all_enabled_workflows(&self) -> Result<Vec<workflow::WorkflowRecord>> {
         workflow::list_all_enabled_workflows(&self.pool).await
     }
@@ -3629,6 +3918,7 @@ impl Db {
     /// from the scheduler scan), never client-supplied — `workflows` is keyed
     /// `(community_id, id)`, so the claim must bind both to avoid fanning
     /// across communities that share the workflow UUID.
+    #[datastore_span(name = "claim_scheduled_workflow_fire", system = "postgresql")]
     pub async fn claim_scheduled_workflow_fire(
         &self,
         community_id: CommunityId,
@@ -3645,6 +3935,7 @@ impl Db {
     }
 
     /// Fetch the latest claimed schedule instant for interval trigger anchoring.
+    #[datastore_span(name = "latest_scheduled_workflow_fire", system = "postgresql")]
     pub async fn latest_scheduled_workflow_fire(
         &self,
         community_id: CommunityId,
@@ -3654,6 +3945,7 @@ impl Db {
     }
 
     /// Attach the workflow run id created from a won scheduled-fire claim.
+    #[datastore_span(name = "attach_scheduled_workflow_run", system = "postgresql")]
     pub async fn attach_scheduled_workflow_run(
         &self,
         community_id: CommunityId,
@@ -3672,6 +3964,7 @@ impl Db {
     }
 
     /// Delete old scheduled workflow fire claims before a retention cutoff.
+    #[datastore_span(name = "prune_scheduled_workflow_fires_before", system = "postgresql")]
     pub async fn prune_scheduled_workflow_fires_before(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
@@ -3680,6 +3973,7 @@ impl Db {
     }
 
     /// Update a workflow's name, definition, and hash.
+    #[datastore_span(name = "update_workflow", system = "postgresql")]
     pub async fn update_workflow(
         &self,
         community_id: CommunityId,
@@ -3700,6 +3994,7 @@ impl Db {
     }
 
     /// Update a workflow's status.
+    #[datastore_span(name = "update_workflow_status", system = "postgresql")]
     pub async fn update_workflow_status(
         &self,
         community_id: CommunityId,
@@ -3710,6 +4005,7 @@ impl Db {
     }
 
     /// Enable or disable a workflow.
+    #[datastore_span(name = "set_workflow_enabled", system = "postgresql")]
     pub async fn set_workflow_enabled(
         &self,
         community_id: CommunityId,
@@ -3721,6 +4017,7 @@ impl Db {
 
     /// Disable all of an owner's workflows in a channel (SEC-006, on
     /// membership loss). Returns the number of workflows disabled.
+    #[datastore_span(name = "disable_workflows_for_owner_in_channel", system = "postgresql")]
     pub async fn disable_workflows_for_owner_in_channel(
         &self,
         community_id: CommunityId,
@@ -3737,12 +4034,14 @@ impl Db {
     }
 
     /// Delete a workflow and all its runs/approvals.
+    #[datastore_span(name = "delete_workflow", system = "postgresql")]
     pub async fn delete_workflow(&self, community_id: CommunityId, id: Uuid) -> Result<()> {
         workflow::delete_workflow(&self.pool, community_id, id).await
     }
 
     /// Delete a workflow only when it belongs to the provided owner.
     /// Returns the deleted workflow's `channel_id`.
+    #[datastore_span(name = "delete_workflow_for_owner", system = "postgresql")]
     pub async fn delete_workflow_for_owner(
         &self,
         community_id: CommunityId,
@@ -3754,6 +4053,7 @@ impl Db {
 
     /// Find a workflow by owner pubkey and name within a community. Used for
     /// NIP-09 a-tag deletion where the d-tag is the workflow name (not UUID).
+    #[datastore_span(name = "find_workflow_by_owner_and_name", system = "postgresql")]
     pub async fn find_workflow_by_owner_and_name(
         &self,
         community_id: CommunityId,
@@ -3764,6 +4064,7 @@ impl Db {
     }
 
     /// Create a new workflow run.
+    #[datastore_span(name = "create_workflow_run", system = "postgresql")]
     pub async fn create_workflow_run(
         &self,
         community_id: CommunityId,
@@ -3782,6 +4083,7 @@ impl Db {
     }
 
     /// Fetch a single workflow run, scoped to its community.
+    #[datastore_span(name = "get_workflow_run", system = "postgresql")]
     pub async fn get_workflow_run(
         &self,
         community_id: CommunityId,
@@ -3791,6 +4093,7 @@ impl Db {
     }
 
     /// List runs for a workflow.
+    #[datastore_span(name = "list_workflow_runs", system = "postgresql")]
     pub async fn list_workflow_runs(
         &self,
         community_id: CommunityId,
@@ -3800,7 +4103,29 @@ impl Db {
         workflow::list_workflow_runs(&self.pool, community_id, workflow_id, limit).await
     }
 
+    /// List one keyset-paginated page of workflow runs.
+    #[datastore_span(name = "list_workflow_runs_page", system = "postgresql")]
+    pub async fn list_workflow_runs_page(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        before: Option<chrono::DateTime<chrono::Utc>>,
+        before_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<workflow::WorkflowRunRecord>> {
+        workflow::list_workflow_runs_page(
+            &self.pool,
+            community_id,
+            workflow_id,
+            before,
+            before_id,
+            limit,
+        )
+        .await
+    }
+
     /// Update a workflow run's status.
+    #[datastore_span(name = "update_workflow_run", system = "postgresql")]
     pub async fn update_workflow_run(
         &self,
         community_id: CommunityId,
@@ -3808,7 +4133,7 @@ impl Db {
         status: workflow::RunStatus,
         current_step: i32,
         trace: &serde_json::Value,
-        error: Option<&str>,
+        failure: Option<workflow::WorkflowRunFailure<'_>>,
     ) -> Result<()> {
         workflow::update_workflow_run(
             &self.pool,
@@ -3817,17 +4142,19 @@ impl Db {
             status,
             current_step,
             trace,
-            error,
+            failure,
         )
         .await
     }
 
     /// Create an approval request.
+    #[datastore_span(name = "create_approval", system = "postgresql")]
     pub async fn create_approval(&self, params: workflow::CreateApprovalParams<'_>) -> Result<()> {
         workflow::create_approval(&self.pool, params).await
     }
 
     /// Fetch an approval by raw token.
+    #[datastore_span(name = "get_approval", system = "postgresql")]
     pub async fn get_approval(
         &self,
         community_id: CommunityId,
@@ -3837,6 +4164,7 @@ impl Db {
     }
 
     /// Fetch an approval by its already-hashed token (no re-hashing).
+    #[datastore_span(name = "get_approval_by_stored_hash", system = "postgresql")]
     pub async fn get_approval_by_stored_hash(
         &self,
         community_id: CommunityId,
@@ -3846,6 +4174,7 @@ impl Db {
     }
 
     /// Fetch all approvals for a workflow run.
+    #[datastore_span(name = "get_run_approvals", system = "postgresql")]
     pub async fn get_run_approvals(
         &self,
         community_id: CommunityId,
@@ -3856,6 +4185,7 @@ impl Db {
     }
 
     /// Update an approval's status.
+    #[datastore_span(name = "update_approval", system = "postgresql")]
     pub async fn update_approval(
         &self,
         community_id: CommunityId,
@@ -3876,6 +4206,7 @@ impl Db {
     }
 
     /// Update an approval by its already-hashed token (no re-hashing).
+    #[datastore_span(name = "update_approval_by_stored_hash", system = "postgresql")]
     pub async fn update_approval_by_stored_hash(
         &self,
         community_id: CommunityId,
@@ -3896,6 +4227,7 @@ impl Db {
     }
 
     /// Ensures monthly partitions exist for the next N months.
+    #[datastore_span(name = "ensure_future_partitions", system = "postgresql")]
     pub async fn ensure_future_partitions(&self, months_ahead: u32) -> Result<()> {
         partition::ensure_future_partitions(&self.pool, months_ahead).await
     }
@@ -3904,6 +4236,7 @@ impl Db {
     ///
     /// Idempotent — safe to call on every startup. No-ops when all rows are already populated.
     /// Runs a single UPDATE touching only NIP-33 rows with NULL d_tag.
+    #[datastore_span(name = "backfill_d_tags", system = "postgresql")]
     pub async fn backfill_d_tags(&self) -> Result<u64> {
         let result = sqlx::query(
             "UPDATE events \
@@ -3912,7 +4245,8 @@ impl Db {
                   WHERE elem->>0 = 'd' LIMIT 1), \
                  '' \
              ) \
-             WHERE kind BETWEEN 30000 AND 39999 AND d_tag IS NULL",
+             WHERE kind BETWEEN 30000 AND 39999 AND d_tag IS NULL \
+               AND community_write_allowed(community_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -3920,6 +4254,7 @@ impl Db {
     }
 
     /// Check if a pubkey is in the allowlist for `community`.
+    #[datastore_span(name = "is_pubkey_allowed", system = "postgresql")]
     pub async fn is_pubkey_allowed(&self, community: CommunityId, pubkey: &[u8]) -> Result<bool> {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM pubkey_allowlist WHERE community_id = $1 AND pubkey = $2",
@@ -3933,6 +4268,7 @@ impl Db {
     }
 
     /// Check if the community allowlist has any entries (i.e. is enforcement active).
+    #[datastore_span(name = "has_allowlist_entries", system = "postgresql")]
     pub async fn has_allowlist_entries(&self, community: CommunityId) -> Result<bool> {
         let row =
             sqlx::query("SELECT COUNT(*) as cnt FROM pubkey_allowlist WHERE community_id = $1")
@@ -3944,6 +4280,7 @@ impl Db {
     }
 
     /// Add a pubkey to the community allowlist.
+    #[datastore_span(name = "add_to_allowlist", system = "postgresql")]
     pub async fn add_to_allowlist(
         &self,
         community: CommunityId,
@@ -3965,6 +4302,7 @@ impl Db {
     }
 
     /// Remove a pubkey from the community allowlist.
+    #[datastore_span(name = "remove_from_allowlist", system = "postgresql")]
     pub async fn remove_from_allowlist(
         &self,
         community: CommunityId,
@@ -3980,6 +4318,7 @@ impl Db {
     }
 
     /// List all pubkeys in the community allowlist.
+    #[datastore_span(name = "list_allowlist", system = "postgresql")]
     pub async fn list_allowlist(&self, community: CommunityId) -> Result<Vec<AllowlistEntry>> {
         let rows = sqlx::query(
             "SELECT pubkey, added_by, added_at, note FROM pubkey_allowlist WHERE community_id = $1 ORDER BY added_at DESC",
@@ -4008,6 +4347,7 @@ impl Db {
     /// `B`; everything else fails closed to the writer, exactly like
     /// [`Db::query_events_routed_bounded`]. Not precedent for routing other
     /// permission reads.
+    #[datastore_span(name = "is_relay_member", system = "postgresql")]
     pub async fn is_relay_member(&self, community: CommunityId, pubkey: &str) -> Result<bool> {
         let path = "relay_membership";
         match self.route_read(path, RoutePredicate::Bounded).await {
@@ -4031,6 +4371,7 @@ impl Db {
     }
 
     /// Returns the relay member record for `pubkey` in `community`, or `None` if not found.
+    #[datastore_span(name = "get_relay_member", system = "postgresql")]
     pub async fn get_relay_member(
         &self,
         community: CommunityId,
@@ -4040,6 +4381,7 @@ impl Db {
     }
 
     /// Returns all relay members of `community` ordered by `created_at` ascending.
+    #[datastore_span(name = "list_relay_members", system = "postgresql")]
     pub async fn list_relay_members(
         &self,
         community: CommunityId,
@@ -4051,6 +4393,7 @@ impl Db {
     ///
     /// Returns `true` if the row was actually inserted, `false` if the pubkey
     /// already existed in `community` (idempotent — `ON CONFLICT DO NOTHING`).
+    #[datastore_span(name = "add_relay_member", system = "postgresql")]
     pub async fn add_relay_member(
         &self,
         community: CommunityId,
@@ -4063,6 +4406,7 @@ impl Db {
 
     /// Claims relay membership via an invite and atomically persists the
     /// accepted policy version when a policy is configured.
+    #[datastore_span(name = "claim_relay_membership", system = "postgresql")]
     pub async fn claim_relay_membership(
         &self,
         community: CommunityId,
@@ -4075,6 +4419,7 @@ impl Db {
     }
 
     /// Returns whether a member has persisted acceptance evidence for a policy version.
+    #[datastore_span(name = "has_join_policy_acceptance", system = "postgresql")]
     pub async fn has_join_policy_acceptance(
         &self,
         community: CommunityId,
@@ -4086,6 +4431,7 @@ impl Db {
     }
 
     /// Removes a relay member from `community` atomically, refusing to delete the owner.
+    #[datastore_span(name = "remove_relay_member", system = "postgresql")]
     pub async fn remove_relay_member(
         &self,
         community: CommunityId,
@@ -4098,6 +4444,7 @@ impl Db {
     ///
     /// Atomic conditional delete — eliminates the TOCTOU race between a
     /// prior role read and the delete. See [`relay_members::remove_relay_member_if_role`].
+    #[datastore_span(name = "remove_relay_member_if_role", system = "postgresql")]
     pub async fn remove_relay_member_if_role(
         &self,
         community: CommunityId,
@@ -4109,6 +4456,7 @@ impl Db {
     }
 
     /// Updates the role of an existing relay member in `community`. Returns `true` if updated.
+    #[datastore_span(name = "update_relay_member_role", system = "postgresql")]
     pub async fn update_relay_member_role(
         &self,
         community: CommunityId,
@@ -4119,6 +4467,7 @@ impl Db {
     }
 
     /// Ensures the owner pubkey exists with role `"owner"` in `community`. Called at startup.
+    #[datastore_span(name = "bootstrap_owner", system = "postgresql")]
     pub async fn bootstrap_owner(&self, community: CommunityId, owner_pubkey: &str) -> Result<()> {
         relay_members::bootstrap_owner(&self.pool, community, owner_pubkey).await
     }
@@ -4133,6 +4482,7 @@ impl Db {
     /// demoting the previous owner(s) to `member`. Verifies
     /// `expected_owner_pubkey` matches the current owner inside the same
     /// transaction to prevent stale-owner races.
+    #[datastore_span(name = "transfer_ownership", system = "postgresql")]
     pub async fn transfer_ownership(
         &self,
         community: CommunityId,
@@ -4152,6 +4502,7 @@ impl Db {
     ///
     /// Idempotent — uses `ON CONFLICT DO NOTHING`. Returns the number of rows
     /// inserted, or 0 if the `pubkey_allowlist` table doesn't exist.
+    #[datastore_span(name = "backfill_from_allowlist", system = "postgresql")]
     pub async fn backfill_from_allowlist(&self, community: CommunityId) -> Result<u64> {
         relay_members::backfill_from_allowlist(&self.pool, community).await
     }
@@ -4161,6 +4512,7 @@ impl Db {
     ///
     /// `max_uses` is `None` for unlimited or `Some(1..=10000)`.
     /// `ttl_secs` must be in the shared invite lifetime range.
+    #[datastore_span(name = "mint_relay_invite", system = "postgresql")]
     pub async fn mint_relay_invite(
         &self,
         community: CommunityId,
@@ -4172,6 +4524,7 @@ impl Db {
     }
 
     /// Delete one bounded batch of invites expired before `cutoff`.
+    #[datastore_span(name = "reap_expired_relay_invites", system = "postgresql")]
     pub async fn reap_expired_relay_invites(
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
@@ -4184,6 +4537,7 @@ impl Db {
     /// transaction with `FOR UPDATE` on the invite row.
     ///
     /// `token_hash` is the SHA-256 of the presented v2 code (32 bytes).
+    #[datastore_span(name = "claim_relay_invite", system = "postgresql")]
     pub async fn claim_relay_invite(
         &self,
         community: CommunityId,
@@ -4202,6 +4556,7 @@ impl Db {
     }
 
     /// Sidecar an accepted product-feedback event, idempotent by event id.
+    #[datastore_span(name = "insert_product_feedback", system = "postgresql")]
     pub async fn insert_product_feedback(
         &self,
         community: CommunityId,
@@ -4211,6 +4566,7 @@ impl Db {
     }
 
     /// List product feedback across the deployment, newest first.
+    #[datastore_span(name = "list_product_feedback", system = "postgresql")]
     pub async fn list_product_feedback(
         &self,
         limit: i64,
@@ -4219,6 +4575,7 @@ impl Db {
     }
 
     /// Insert a tenant-scoped NIP-56 report row, idempotent by report event id.
+    #[datastore_span(name = "insert_moderation_report", system = "postgresql")]
     pub async fn insert_moderation_report(
         &self,
         community: CommunityId,
@@ -4228,6 +4585,7 @@ impl Db {
     }
 
     /// List moderation reports for a community, newest first.
+    #[datastore_span(name = "list_moderation_reports", system = "postgresql")]
     pub async fn list_moderation_reports(
         &self,
         community: CommunityId,
@@ -4238,6 +4596,7 @@ impl Db {
     }
 
     /// Fetch one moderation report by row id.
+    #[datastore_span(name = "get_moderation_report", system = "postgresql")]
     pub async fn get_moderation_report(
         &self,
         community: CommunityId,
@@ -4247,6 +4606,7 @@ impl Db {
     }
 
     /// Fetch one moderation report by signed NIP-56 report event id.
+    #[datastore_span(name = "get_moderation_report_by_event", system = "postgresql")]
     pub async fn get_moderation_report_by_event(
         &self,
         community: CommunityId,
@@ -4256,6 +4616,7 @@ impl Db {
     }
 
     /// Resolve, dismiss, or escalate an open moderation report.
+    #[datastore_span(name = "resolve_moderation_report", system = "postgresql")]
     pub async fn resolve_moderation_report(
         &self,
         community: CommunityId,
@@ -4276,6 +4637,7 @@ impl Db {
     }
 
     /// Upsert a community ban for a member pubkey.
+    #[datastore_span(name = "ban_community_member", system = "postgresql")]
     pub async fn ban_community_member(
         &self,
         community: CommunityId,
@@ -4288,6 +4650,7 @@ impl Db {
     }
 
     /// Lift a community ban for a member pubkey.
+    #[datastore_span(name = "unban_community_member", system = "postgresql")]
     pub async fn unban_community_member(
         &self,
         community: CommunityId,
@@ -4298,6 +4661,7 @@ impl Db {
     }
 
     /// Upsert a community timeout/write-block for a member pubkey.
+    #[datastore_span(name = "timeout_community_member", system = "postgresql")]
     pub async fn timeout_community_member(
         &self,
         community: CommunityId,
@@ -4310,6 +4674,7 @@ impl Db {
     }
 
     /// Clear a community timeout/write-block for a member pubkey.
+    #[datastore_span(name = "untimeout_community_member", system = "postgresql")]
     pub async fn untimeout_community_member(
         &self,
         community: CommunityId,
@@ -4320,6 +4685,7 @@ impl Db {
     }
 
     /// Fetch the active ban/timeout restriction state for enforcement hot paths.
+    #[datastore_span(name = "moderation_restriction_state", system = "postgresql")]
     pub async fn moderation_restriction_state(
         &self,
         community: CommunityId,
@@ -4329,6 +4695,7 @@ impl Db {
     }
 
     /// Fetch the full ban/timeout row for a member pubkey.
+    #[datastore_span(name = "get_community_ban", system = "postgresql")]
     pub async fn get_community_ban(
         &self,
         community: CommunityId,
@@ -4338,6 +4705,7 @@ impl Db {
     }
 
     /// List currently restricted members in a community.
+    #[datastore_span(name = "list_community_restrictions", system = "postgresql")]
     pub async fn list_community_restrictions(
         &self,
         community: CommunityId,
@@ -4346,6 +4714,7 @@ impl Db {
     }
 
     /// Insert a moderation audit action row.
+    #[datastore_span(name = "insert_moderation_action", system = "postgresql")]
     pub async fn insert_moderation_action(
         &self,
         community: CommunityId,
@@ -4355,6 +4724,7 @@ impl Db {
     }
 
     /// List moderation audit action rows, newest first.
+    #[datastore_span(name = "list_moderation_actions", system = "postgresql")]
     pub async fn list_moderation_actions(
         &self,
         community: CommunityId,
@@ -4365,6 +4735,7 @@ impl Db {
 
     /// Return the current owner of git repo name `repo_id` in `community`, or
     /// `None` if unreserved. See [`git_repo::repo_name_owner`].
+    #[datastore_span(name = "repo_name_owner", system = "postgresql")]
     pub async fn repo_name_owner(
         &self,
         community: CommunityId,
@@ -4377,6 +4748,7 @@ impl Db {
     ///
     /// See [`git_repo::reserve_repo_name`] for the outcome semantics. The
     /// per-pubkey quota is enforced by the caller against `count_repos_for_owner`.
+    #[datastore_span(name = "reserve_repo_name", system = "postgresql")]
     pub async fn reserve_repo_name(
         &self,
         community: CommunityId,
@@ -4387,6 +4759,7 @@ impl Db {
     }
 
     /// Count git repos reserved by `owner_pubkey` in `community` (quota check).
+    #[datastore_span(name = "count_repos_for_owner", system = "postgresql")]
     pub async fn count_repos_for_owner(
         &self,
         community: CommunityId,
@@ -4398,6 +4771,7 @@ impl Db {
     /// Release a git repo name reservation held by `owner_pubkey` (rollback).
     ///
     /// Returns the number of rows removed (0 or 1). See [`git_repo::release_repo_name`].
+    #[datastore_span(name = "release_repo_name", system = "postgresql")]
     pub async fn release_repo_name(
         &self,
         community: CommunityId,
@@ -4408,12 +4782,14 @@ impl Db {
     }
 
     /// Returns `true` if `pubkey` (64-char hex) is archived in `community_id`.
+    #[datastore_span(name = "is_archived", system = "postgresql")]
     pub async fn is_archived(&self, community_id: CommunityId, pubkey: &str) -> Result<bool> {
         archived_identities::is_archived(&self.pool, community_id, pubkey).await
     }
 
     /// Archives an identity in `community_id`. Returns `true` if inserted, `false` if already archived.
     #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "archive", system = "postgresql")]
     pub async fn archive(
         &self,
         community_id: CommunityId,
@@ -4438,11 +4814,13 @@ impl Db {
     }
 
     /// Unarchives an identity from `community_id`. Returns `true` if deleted, `false` if absent.
+    #[datastore_span(name = "unarchive", system = "postgresql")]
     pub async fn unarchive(&self, community_id: CommunityId, pubkey: &str) -> Result<bool> {
         archived_identities::unarchive(&self.pool, community_id, pubkey).await
     }
 
     /// Returns all identities archived in `community_id`, ordered by archive time ascending.
+    #[datastore_span(name = "list_archived", system = "postgresql")]
     pub async fn list_archived(
         &self,
         community_id: CommunityId,
@@ -4451,6 +4829,7 @@ impl Db {
     }
 
     /// Soft-delete NIP-29 discovery events for a channel created by a specific relay pubkey.
+    #[datastore_span(name = "soft_delete_discovery_events", system = "postgresql")]
     pub async fn soft_delete_discovery_events(
         &self,
         community_id: CommunityId,
@@ -4476,6 +4855,7 @@ impl Db {
     /// Same-second ties are broken by lowest event `id` (NIP-16 deterministic ordering).
     /// Returns `(event, false)` for stale writes and duplicate IDs — callers should
     /// skip fan-out/dispatch when `was_inserted` is false.
+    #[datastore_span(name = "replace_addressable_event", system = "postgresql")]
     pub async fn replace_addressable_event(
         &self,
         community_id: CommunityId,
@@ -4489,7 +4869,7 @@ impl Db {
             .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
 
         // Collisions only cause extra serialization; they cannot change behavior.
-        let lock_key = event_replacement_lock_key(
+        let lock_key = replaceable::event_replacement_lock_key(
             community_id,
             kind_i32,
             pubkey_bytes.as_slice(),
@@ -4588,13 +4968,12 @@ impl Db {
             ));
         }
 
-        tx.commit().await?;
+        // The replaceable event and its denormalized mention index are one
+        // authoritative discovery write. An indexing error must roll back the
+        // new event and restore the previously-live event.
+        crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
 
-        // Mentions are a denormalized index — safe outside the transaction.
-        // insert_event() normally handles this, but we inlined the INSERT above.
-        if let Err(e) = crate::insert_mentions(&self.pool, community_id, event, channel_id).await {
-            tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-        }
+        tx.commit().await?;
 
         Ok((
             StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
@@ -4608,6 +4987,10 @@ impl Db {
     /// Snapshot and canonical rows are compared directly rather than by
     /// timestamp: relay membership events use whole-second Nostr timestamps,
     /// and multiple mutations within one second must still be repaired.
+    #[datastore_span(
+        name = "nip43_membership_snapshot_needs_reconciliation",
+        system = "postgresql"
+    )]
     pub async fn nip43_membership_snapshot_needs_reconciliation(
         &self,
         community_id: CommunityId,
@@ -4658,6 +5041,7 @@ impl Db {
     /// prevents the stale-snapshot race where a concurrent publication reads
     /// older state and overwrites a newer snapshot by arrival order.
     ///
+    #[datastore_span(name = "publish_nip43_membership_locked", system = "postgresql")]
     pub async fn publish_nip43_membership_locked(
         &self,
         community_id: CommunityId,
@@ -4668,8 +5052,12 @@ impl Db {
         let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
         let pubkey_bytes = relay_keypair.public_key().to_bytes();
 
-        let lock_key =
-            event_replacement_lock_key(community_id, kind_i32, pubkey_bytes.as_slice(), None);
+        let lock_key = replaceable::event_replacement_lock_key(
+            community_id,
+            kind_i32,
+            pubkey_bytes.as_slice(),
+            None,
+        );
 
         let mut tx = self.pool.begin().await?;
 
@@ -4774,242 +5162,6 @@ impl Db {
             StoredEvent::with_received_at(event, received_at, None, true),
             true,
             member_count,
-        ))
-    }
-
-    /// Atomically replace a NIP-33 parameterized replaceable event (kind 30000–39999).
-    ///
-    /// Keeps only the event with the highest `created_at` per `(kind, pubkey, d_tag)`.
-    /// Same-second ties are broken by lowest event `id` (deterministic ordering).
-    /// The entire check → retire old payload → insert runs in a single transaction
-    /// with an advisory lock to prevent concurrent-insert races. NIP-RS read-state
-    /// coordinates hard-delete the superseded payload and preserve a compact
-    /// ordering watermark. Buzz mesh status coordinates also hard-delete their
-    /// superseded heartbeat payload because only the live head has product
-    /// value; other NIP-33 kinds retain soft-deleted history.
-    ///
-    /// **Channel policy:** NIP-33 replacement keys on `(kind, pubkey, d_tag)` globally —
-    /// `channel_id` is NOT part of the replacement key. This matches the Nostr spec:
-    /// an author's parameterized replaceable event is a single global resource identified
-    /// by its d-tag, regardless of which channel it was submitted to. The `channel_id`
-    /// parameter is stored on the new row for query scoping but does not affect replacement.
-    ///
-    /// Note: `replace_addressable_event()` keys on `channel_id` because it serves
-    /// relay-signed NIP-29 group metadata (kind 39000–39002) where the relay is the
-    /// author and channel_id distinguishes groups. User-submitted NIP-33 events use
-    /// this function instead, where the author's pubkey + d-tag is the natural key.
-    pub async fn replace_parameterized_event(
-        &self,
-        community_id: CommunityId,
-        event: &nostr::Event,
-        d_tag: &str,
-        channel_id: Option<Uuid>,
-    ) -> Result<(StoredEvent, bool)> {
-        let kind_i32 = buzz_core::kind::event_kind_i32(event);
-        let pubkey_bytes = event.pubkey.to_bytes();
-        let created_at_secs = event.created_at.as_secs() as i64;
-        let created_at = chrono::DateTime::from_timestamp(created_at_secs, 0)
-            .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
-
-        let lock_key = event_replacement_lock_key(
-            community_id,
-            kind_i32,
-            pubkey_bytes.as_slice(),
-            Some(d_tag.as_bytes()),
-        );
-
-        let mut tx = self.pool.begin().await?;
-
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await?;
-
-        let d_tag_count = event
-            .tags
-            .iter()
-            .filter(|tag| tag.as_slice().first().is_some_and(|part| part == "d"))
-            .count();
-        let has_exact_d_tag = event.tags.iter().any(|tag| {
-            let parts = tag.as_slice();
-            parts.len() >= 2 && parts[0] == "d" && parts[1] == d_tag
-        });
-        let read_state_t_tag_count = event
-            .tags
-            .iter()
-            .filter(|tag| {
-                let parts = tag.as_slice();
-                parts.len() == 2 && parts[0] == "t" && parts[1] == "read-state"
-            })
-            .count();
-        let is_nip_rs = kind_i32 == buzz_core::kind::KIND_READ_STATE as i32
-            && d_tag_count == 1
-            && has_exact_d_tag
-            && d_tag.strip_prefix("read-state:").is_some_and(|slot| {
-                slot.len() == 32
-                    && slot
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            })
-            && read_state_t_tag_count == 1;
-        let is_buzz_mesh_status = kind_i32 == buzz_core::kind::KIND_BOOKMARK_SET as i32
-            && d_tag.starts_with("buzz-mesh-member-status:")
-            && event.tags.iter().any(|tag| {
-                let parts = tag.as_slice();
-                parts.len() == 2 && parts[0] == "k" && parts[1] == "buzz-mesh-status"
-            });
-        let hard_delete_superseded = is_nip_rs || is_buzz_mesh_status;
-
-        // Check the live head and, for NIP-RS, the compact historical ordering
-        // watermark. The watermark remains after a NIP-09 coordinate deletion,
-        // preventing a previously accepted signed blob from being resurrected.
-        let existing: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = sqlx::query_as(
-            "SELECT created_at, id FROM events \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL \
-             ORDER BY created_at DESC, id ASC LIMIT 1",
-        )
-        .bind(community_id.as_uuid())
-        .bind(kind_i32)
-        .bind(pubkey_bytes.as_slice())
-        .bind(d_tag)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let watermark: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = if is_nip_rs {
-            sqlx::query_as(
-                "SELECT created_at, event_id FROM parameterized_event_watermarks \
-                 WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4",
-            )
-            .bind(community_id.as_uuid())
-            .bind(kind_i32)
-            .bind(pubkey_bytes.as_slice())
-            .bind(d_tag)
-            .fetch_optional(&mut *tx)
-            .await?
-        } else {
-            None
-        };
-
-        // Stale-write protection: reject if either durable ordering source
-        // dominates the incoming tuple. Equal timestamps use lowest event id.
-        let incoming_id = event.id.as_bytes().as_slice();
-        let dominated =
-            existing
-                .iter()
-                .chain(watermark.iter())
-                .any(|(accepted_ts, accepted_id)| {
-                    created_at < *accepted_ts
-                        || (created_at == *accepted_ts && incoming_id >= accepted_id.as_slice())
-                });
-        if dominated {
-            tx.rollback().await?;
-            let received_at = chrono::Utc::now();
-            return Ok((
-                StoredEvent::with_received_at(event.clone(), received_at, channel_id, false),
-                false,
-            ));
-        }
-
-        if existing.is_some() {
-            if is_nip_rs {
-                // Migration 0011 rejects regex-coordinate hard deletes from
-                // pre-fix writers. Authorize only this corrected NIP-RS delete,
-                // transaction-locally so pooled connections cannot leak it.
-                sqlx::query("SELECT set_config('buzz.nip_rs_hard_delete', 'on', true)")
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            let statement = if hard_delete_superseded {
-                "DELETE FROM events \
-                 WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL"
-            } else {
-                "UPDATE events SET deleted_at = NOW() \
-                 WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL"
-            };
-            sqlx::query(statement)
-                .bind(community_id.as_uuid())
-                .bind(kind_i32)
-                .bind(pubkey_bytes.as_slice())
-                .bind(d_tag)
-                .execute(&mut *tx)
-                .await?;
-
-            if hard_delete_superseded {
-                if let Some((_, existing_id)) = &existing {
-                    // Event first, mentions second: migration 0009's live-event
-                    // fence uses this global lock order to avoid deadlocks.
-                    sqlx::query(
-                        "DELETE FROM event_mentions WHERE community_id = $1 AND event_id = $2",
-                    )
-                    .bind(community_id.as_uuid())
-                    .bind(existing_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-        }
-
-        // Insert the new event inside the transaction.
-        let sig_bytes = event.sig.serialize();
-        let tags_json = serde_json::to_value(&event.tags)?;
-        let received_at = chrono::Utc::now();
-
-        let insert_result = sqlx::query(
-            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(community_id.as_uuid())
-        .bind(event.id.as_bytes().as_slice())
-        .bind(pubkey_bytes.as_slice())
-        .bind(created_at)
-        .bind(kind_i32)
-        .bind(&tags_json)
-        .bind(&event.content)
-        .bind(sig_bytes.as_slice())
-        .bind(received_at)
-        .bind(channel_id)
-        .bind(d_tag)
-        .bind(event::extract_not_before(event))
-        .execute(&mut *tx)
-        .await?;
-
-        let was_inserted = insert_result.rows_affected() > 0;
-        if !was_inserted {
-            tx.rollback().await?;
-            return Ok((
-                StoredEvent::with_received_at(event.clone(), received_at, channel_id, false),
-                false,
-            ));
-        }
-
-        if is_nip_rs {
-            sqlx::query(
-                "INSERT INTO parameterized_event_watermarks \
-                     (community_id, kind, pubkey, d_tag, created_at, event_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (community_id, kind, pubkey, d_tag) DO UPDATE SET \
-                     created_at = EXCLUDED.created_at, event_id = EXCLUDED.event_id",
-            )
-            .bind(community_id.as_uuid())
-            .bind(kind_i32)
-            .bind(pubkey_bytes.as_slice())
-            .bind(d_tag)
-            .bind(created_at)
-            .bind(incoming_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-
-        // Mentions are a denormalized index — safe outside the transaction.
-        if let Err(e) = crate::insert_mentions(&self.pool, community_id, event, channel_id).await {
-            tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-        }
-
-        Ok((
-            StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
-            true,
         ))
     }
 }
@@ -5127,6 +5279,427 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn unmigrated_roster_fence_blocks_startup_until_0032_is_applied() {
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (pool, scratch_name) =
+            create_scratch_db_through(&admin, "roster_fence_unmigrated", Some(31)).await;
+        let db = Db::from_pool(pool.clone());
+
+        let error = db
+            .verify_channel_roster_fence()
+            .await
+            .expect_err("pre-0032 schema must block roster publishers");
+        assert!(
+            error.to_string().contains("channel roster fence trigger"),
+            "startup gate must report the missing schema fence: {error}"
+        );
+        let rows_before: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE kind = 39002")
+            .fetch_one(&pool)
+            .await
+            .expect("count pre-migration rosters");
+        assert_eq!(
+            rows_before, 0,
+            "failed startup gate must not publish a roster"
+        );
+
+        migration::run_migrations(&pool)
+            .await
+            .expect("apply migration 0032");
+        db.verify_channel_roster_fence()
+            .await
+            .expect("0032 must open the startup gate");
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn channel_roster_fence_behavior_verification_detects_inert_function() {
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (pool, scratch_name) = create_scratch_db(&admin, "roster_fence_inert").await;
+        let db = Db::from_pool(pool.clone());
+
+        sqlx::raw_sql(
+            "CREATE OR REPLACE FUNCTION guard_channel_roster_snapshot() \
+             RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;",
+        )
+        .execute(&pool)
+        .await
+        .expect("replace roster fence with inert body");
+        let error = db
+            .verify_channel_roster_fence()
+            .await
+            .expect_err("inert roster fence must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("stale probe roster was accepted"),
+            "behavior probe must identify inert semantics: {error}"
+        );
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn channel_roster_fence_catalog_verification_fails_closed() {
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (pool, scratch_name) = create_scratch_db(&admin, "roster_fence_catalog").await;
+        let db = Db::from_pool(pool.clone());
+
+        db.verify_channel_roster_fence()
+            .await
+            .expect("migrated roster fence must verify");
+
+        let child: String = sqlx::query_scalar(
+            "SELECT n.nspname || '.' || c.relname \
+             FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE i.inhparent = 'public.events'::regclass ORDER BY i.inhrelid LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load event partition");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {child} DISABLE TRIGGER trg_events_guard_channel_roster_snapshot"
+        )))
+        .execute(&pool)
+        .await
+        .expect("disable partition roster trigger");
+        let error = db
+            .verify_channel_roster_fence()
+            .await
+            .expect_err("disabled partition roster fence must fail closed");
+        assert!(
+            error.to_string().contains(&child),
+            "verification must identify the unfenced partition: {error}"
+        );
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn addressable_replacement_rolls_back_when_mention_indexing_fails() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (pool, scratch_name) = create_scratch_db(&admin, "atomic_addressable").await;
+        let db = Db::from_pool(pool.clone());
+        let community_uuid = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        let keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        seed_community_channel(&pool, community_uuid, channel, &owner_keys).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let member = owner_keys.public_key().to_hex();
+        let tags = || {
+            vec![
+                Tag::parse(["d", channel.to_string().as_str()]).expect("d tag"),
+                Tag::parse(["p", member.as_str(), "", "owner"]).expect("p tag"),
+            ]
+        };
+        let base = Timestamp::now().as_secs();
+        let old = EventBuilder::new(Kind::Custom(39002), "old")
+            .tags(tags())
+            .custom_created_at(Timestamp::from(base))
+            .sign_with_keys(&keys)
+            .expect("sign old");
+        db.replace_addressable_event(community, &old, Some(channel))
+            .await
+            .expect("insert old roster");
+
+        sqlx::query(
+            "CREATE FUNCTION reject_test_mention() RETURNS trigger AS $$ \
+             BEGIN RAISE EXCEPTION 'injected mention failure'; END; \
+             $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .expect("create failure function");
+        sqlx::query(
+            "CREATE TRIGGER reject_test_mention BEFORE INSERT ON event_mentions \
+             FOR EACH ROW EXECUTE FUNCTION reject_test_mention()",
+        )
+        .execute(&pool)
+        .await
+        .expect("install failure injection");
+
+        let new = EventBuilder::new(Kind::Custom(39002), "new")
+            .tags(tags())
+            .custom_created_at(Timestamp::from(base + 1))
+            .sign_with_keys(&keys)
+            .expect("sign new");
+        let error = db
+            .replace_addressable_event(community, &new, Some(channel))
+            .await
+            .expect_err("mention failure must fail replacement");
+        assert!(error.to_string().contains("injected mention failure"));
+
+        let live_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND channel_id=$2 \
+             AND kind=39002 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(channel)
+        .fetch_one(&pool)
+        .await
+        .expect("query live roster");
+        assert_eq!(live_id, old.id.as_bytes(), "old roster must remain live");
+        let new_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(new.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count rolled-back event");
+        assert_eq!(new_rows, 0, "new roster must roll back with its index");
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn stale_legacy_roster_cannot_replace_new_locked_snapshot() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (setup_pool, scratch_name) = create_scratch_db(&admin, "mixed_roster_writer").await;
+        let base_url = admin_url().await;
+        let slash = base_url.rfind('/').expect("database URL has path segment");
+        let scratch_url = format!("{}/{}", &base_url[..slash], scratch_name);
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(1))
+            .connect(&scratch_url)
+            .await
+            .expect("connect one-connection scratch pool");
+        setup_pool.close().await;
+        let db = Db::from_pool(pool.clone());
+        let community_uuid = Uuid::new_v4();
+        let community = CommunityId::from_uuid(community_uuid);
+        let channel = Uuid::new_v4();
+        let relay_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let owner = owner_keys.public_key().to_bytes();
+        seed_community_channel(&pool, community_uuid, channel, &owner_keys).await;
+
+        // This is the old pod's unlocked capture A. It remains in process memory
+        // while a role-only canonical mutation advances and the new pod publishes B.
+        let base = Timestamp::now().as_secs();
+        let roster = |members: &[(&[u8], &str)], timestamp| {
+            let tags =
+                std::iter::once(Tag::parse(["d", channel.to_string().as_str()]).expect("d tag"))
+                    .chain(members.iter().map(|(member, role)| {
+                        Tag::parse(["p", hex::encode(member).as_str(), "", *role]).expect("p tag")
+                    }))
+                    .collect::<Vec<_>>();
+            EventBuilder::new(Kind::Custom(39002), "")
+                .tags(tags)
+                .custom_created_at(Timestamp::from(timestamp))
+                .sign_with_keys(&relay_keys)
+                .expect("sign roster")
+        };
+
+        let newcomer = Keys::generate().public_key().to_bytes();
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'member', $4)",
+        )
+        .bind(community_uuid)
+        .bind(channel)
+        .bind(newcomer.as_slice())
+        .bind(owner.as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed member before legacy capture");
+        let stale_a = roster(
+            &[(owner.as_slice(), "owner"), (newcomer.as_slice(), "member")],
+            base + 2,
+        );
+
+        sqlx::query(
+            "UPDATE channel_members SET role = 'admin' \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(community_uuid)
+        .bind(channel)
+        .bind(newcomer.as_slice())
+        .execute(&pool)
+        .await
+        .expect("commit newer canonical role");
+
+        let relay_pubkey = relay_keys.public_key().to_bytes();
+        let mut snapshot = db
+            .lock_member_snapshot(community, channel, &relay_pubkey)
+            .await
+            .expect("new writer captures locked roster B");
+        let fresh_b = roster(
+            &[(owner.as_slice(), "owner"), (newcomer.as_slice(), "admin")],
+            base + 1,
+        );
+        assert!(
+            snapshot
+                .replace_member_event(community, channel, &fresh_b)
+                .await
+                .expect("new writer publishes B")
+                .1
+        );
+        snapshot
+            .release()
+            .await
+            .expect("commit B and release locks");
+
+        // The legacy canonical path takes the replacement key, soft-deletes B,
+        // then attempts its newer-timestamp stale A. Migration 0032 rejects the
+        // INSERT; transaction rollback must restore B. A one-connection pool
+        // proves the lock order does not turn this compatibility path into a
+        // self-deadlock.
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            db.replace_addressable_event(community, &stale_a, Some(channel)),
+        )
+        .await
+        .expect("legacy replacement must not deadlock")
+        .expect_err("stale captured roster A must be rejected");
+        assert!(
+            matches!(
+                error,
+                DbError::Sqlx(sqlx::Error::Database(ref db_error))
+                    if db_error.code().as_deref() == Some("23514")
+            ),
+            "expected roster fence check violation, got {error:?}"
+        );
+
+        let live_ids: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND channel_id=$2 \
+             AND kind=39002 AND pubkey=$3 AND deleted_at IS NULL",
+        )
+        .bind(community_uuid)
+        .bind(channel)
+        .bind(relay_pubkey.as_slice())
+        .fetch_all(&pool)
+        .await
+        .expect("load live roster heads");
+        assert_eq!(live_ids, vec![fresh_b.id.as_bytes().to_vec()]);
+        let stale_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community_uuid)
+                .bind(stale_a.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count rejected stale roster");
+        assert_eq!(stale_rows, 0, "stale roster insert must roll back");
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn desired_schema_rejects_stale_legacy_roster_role() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let scratch_name = format!("schema_roster_role_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {scratch_name}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create desired-schema scratch db");
+        let base_url = admin_url().await;
+        let slash = base_url.rfind('/').expect("database URL has path segment");
+        let scratch_url = format!("{}/{}", &base_url[..slash], scratch_name);
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&scratch_url)
+            .await
+            .expect("connect desired-schema scratch db");
+        sqlx::raw_sql(include_str!("../../../schema/schema.sql"))
+            .execute(&pool)
+            .await
+            .expect("apply desired-state schema");
+
+        let db = Db::from_pool(pool.clone());
+        let community_uuid = Uuid::new_v4();
+        let community = CommunityId::from_uuid(community_uuid);
+        let channel = Uuid::new_v4();
+        let relay_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let owner = owner_keys.public_key().to_bytes();
+        seed_community_channel(&pool, community_uuid, channel, &owner_keys).await;
+        let member = Keys::generate().public_key().to_bytes();
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'admin', $4)",
+        )
+        .bind(community_uuid)
+        .bind(channel)
+        .bind(member.as_slice())
+        .bind(owner.as_slice())
+        .execute(&pool)
+        .await
+        .expect("seed canonical admin");
+
+        let roster = |role: &str, timestamp| {
+            EventBuilder::new(Kind::Custom(39002), "")
+                .tags(vec![
+                    Tag::parse(["d", channel.to_string().as_str()]).expect("d tag"),
+                    Tag::parse(["p", hex::encode(owner).as_str(), "", "owner"])
+                        .expect("owner p tag"),
+                    Tag::parse(["p", hex::encode(member).as_str(), "", role])
+                        .expect("member p tag"),
+                ])
+                .custom_created_at(Timestamp::from(timestamp))
+                .sign_with_keys(&relay_keys)
+                .expect("sign roster")
+        };
+        let base = Timestamp::now().as_secs();
+        let fresh = roster("admin", base);
+        assert!(
+            db.replace_addressable_event(community, &fresh, Some(channel))
+                .await
+                .expect("publish canonical role")
+                .1
+        );
+        let stale = roster("member", base + 1);
+        let error = db
+            .replace_addressable_event(community, &stale, Some(channel))
+            .await
+            .expect_err("desired-state fence must reject stale role");
+        assert!(matches!(
+            error,
+            DbError::Sqlx(sqlx::Error::Database(ref db_error))
+                if db_error.code().as_deref() == Some("23514")
+        ));
+        let live_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND channel_id=$2 \
+             AND kind=39002 AND deleted_at IS NULL",
+        )
+        .bind(community_uuid)
+        .bind(channel)
+        .fetch_one(&pool)
+        .await
+        .expect("load desired-state live roster");
+        assert_eq!(live_id, fresh.id.as_bytes().to_vec());
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn nip_rs_replacement_hard_deletes_payload_and_watermark_rejects_replay() {
         use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
@@ -5200,6 +5773,456 @@ mod tests {
         .await
         .expect("count live NIP-RS rows");
         assert_eq!(live, 0, "watermark must block stale resurrection");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_rs_transaction_operation_restores_hard_delete_opt_in() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let keys = Keys::generate();
+        let base = Timestamp::now().as_secs();
+        let replace_d_tag = format!("read-state:{}", "b".repeat(32));
+        let victim_d_tag = format!("read-state:{}", "c".repeat(32));
+        let event = |d_tag: &str, content: &str, timestamp: u64| {
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_READ_STATE as u16),
+                content,
+            )
+            .tags(vec![
+                Tag::parse(["d", d_tag]).expect("d tag"),
+                Tag::parse(["t", "read-state"]).expect("t tag"),
+            ])
+            .custom_created_at(Timestamp::from(timestamp))
+            .sign_with_keys(&keys)
+            .expect("sign read state")
+        };
+        let old = event(&replace_d_tag, "old", base);
+        let new = event(&replace_d_tag, "new", base + 1);
+        let victim = event(&victim_d_tag, "victim", base);
+
+        assert!(
+            db.replace_parameterized_event(community, &old, &replace_d_tag, None)
+                .await
+                .expect("insert old head")
+                .1
+        );
+        assert!(
+            db.replace_parameterized_event(community, &victim, &victim_d_tag, None)
+                .await
+                .expect("insert victim head")
+                .1
+        );
+
+        let mut tx = db
+            .begin_transaction()
+            .await
+            .expect("begin caller transaction");
+        let result = db
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                community,
+                &new,
+                &replace_d_tag,
+                None,
+                replaceable::ParameterizedReplacePrecondition::Unconditional,
+            )
+            .await
+            .expect("replace inside caller transaction");
+        assert_eq!(
+            result.status,
+            replaceable::ParameterizedReplaceStatus::Inserted
+        );
+
+        let leaked: Option<String> = sqlx::query_scalar(
+            "SELECT NULLIF(current_setting('buzz.nip_rs_hard_delete', true), '')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read hard-delete opt-in after replacement");
+        assert_ne!(leaked.as_deref(), Some("on"));
+
+        let unauthorized = sqlx::query(
+            "DELETE FROM events WHERE community_id=$1 AND kind=30078 \
+             AND pubkey=$2 AND d_tag=$3 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(keys.public_key().to_bytes())
+        .bind(&victim_d_tag)
+        .execute(&mut *tx)
+        .await;
+        assert!(
+            unauthorized.is_err(),
+            "replacement opt-in must not authorize later caller SQL"
+        );
+        tx.rollback().await.expect("roll back caller transaction");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn parameterized_replacement_in_existing_transaction_honors_revision_and_rollback() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let keys = Keys::generate();
+        let d_tag = format!("transactional-project-{}", Uuid::new_v4().simple());
+        let base = Timestamp::now().as_secs();
+        let event = |content: &str, timestamp: u64| {
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_PROJECT as u16), content)
+                .tags(vec![Tag::parse(["d", d_tag.as_str()]).expect("d tag")])
+                .custom_created_at(Timestamp::from(timestamp))
+                .sign_with_keys(&keys)
+                .expect("sign project")
+        };
+        let old = event("old", base);
+        let new = event("new", base + 1);
+
+        assert!(
+            db.replace_parameterized_event(community, &old, &d_tag, None)
+                .await
+                .expect("insert old head")
+                .1
+        );
+
+        let mut tx = db.begin_transaction().await.expect("begin replacement tx");
+        let outcome = db
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                community,
+                &new,
+                &d_tag,
+                None,
+                replaceable::ParameterizedReplacePrecondition::ExpectedRevision(
+                    old.id.as_bytes().as_slice(),
+                ),
+            )
+            .await
+            .expect("replace inside caller transaction");
+        assert_eq!(
+            outcome.status,
+            replaceable::ParameterizedReplaceStatus::Inserted
+        );
+        tx.rollback().await.expect("roll back replacement tx");
+
+        let live_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_PROJECT as i32)
+        .bind(keys.public_key().to_bytes())
+        .bind(&d_tag)
+        .fetch_one(&db.pool)
+        .await
+        .expect("load live head after rollback");
+        assert_eq!(live_id, old.id.as_bytes().to_vec());
+
+        let mut tx = db
+            .begin_transaction()
+            .await
+            .expect("begin stale revision tx");
+        let mismatch = db
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                community,
+                &new,
+                &d_tag,
+                None,
+                replaceable::ParameterizedReplacePrecondition::ExpectedRevision(
+                    [0x42; 32].as_slice(),
+                ),
+            )
+            .await
+            .expect("evaluate stale revision");
+        assert_eq!(
+            mismatch.status,
+            replaceable::ParameterizedReplaceStatus::RevisionMismatch
+        );
+        tx.rollback().await.expect("roll back stale revision tx");
+
+        let missing_d_tag = format!("missing-project-{}", Uuid::new_v4().simple());
+        let missing = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_PROJECT as u16),
+            "missing",
+        )
+        .tags(vec![
+            Tag::parse(["d", missing_d_tag.as_str()]).expect("missing d tag")
+        ])
+        .custom_created_at(Timestamp::from(base + 2))
+        .sign_with_keys(&keys)
+        .expect("sign missing project");
+        let mut tx = db
+            .begin_transaction()
+            .await
+            .expect("begin missing revision tx");
+        let missing_result = db
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                community,
+                &missing,
+                &missing_d_tag,
+                None,
+                replaceable::ParameterizedReplacePrecondition::ExpectedRevision(
+                    [0x24; 32].as_slice(),
+                ),
+            )
+            .await
+            .expect("evaluate missing revision");
+        assert_eq!(
+            missing_result.status,
+            replaceable::ParameterizedReplaceStatus::RevisionMissing
+        );
+        tx.rollback().await.expect("roll back missing revision tx");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn parameterized_replacement_rolls_back_when_mention_indexing_fails() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (pool, scratch_name) = create_scratch_db(&admin, "atomic_parameterized").await;
+        let db = Db::from_pool(pool.clone());
+        let community = CommunityId::from_uuid(make_community(&pool).await);
+        let keys = Keys::generate();
+        let mentioned = Keys::generate().public_key().to_hex();
+        let d_tag = format!("mention-project-{}", Uuid::new_v4().simple());
+        let tags = || {
+            vec![
+                Tag::parse(["d", d_tag.as_str()]).expect("d tag"),
+                Tag::parse(["p", mentioned.as_str()]).expect("p tag"),
+            ]
+        };
+        let base = Timestamp::now().as_secs();
+        let old = EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_PROJECT as u16), "old")
+            .tags(tags())
+            .custom_created_at(Timestamp::from(base))
+            .sign_with_keys(&keys)
+            .expect("sign old project");
+        let new = EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_PROJECT as u16), "new")
+            .tags(tags())
+            .custom_created_at(Timestamp::from(base + 1))
+            .sign_with_keys(&keys)
+            .expect("sign new project");
+
+        assert!(
+            db.replace_parameterized_event(community, &old, &d_tag, None)
+                .await
+                .expect("insert old project")
+                .1
+        );
+        sqlx::query(
+            "CREATE FUNCTION reject_test_mention() RETURNS trigger AS $$ \
+             BEGIN RAISE EXCEPTION 'injected mention failure'; END; \
+             $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .expect("create failure function");
+        sqlx::query(
+            "CREATE TRIGGER reject_test_mention BEFORE INSERT ON event_mentions \
+             FOR EACH ROW EXECUTE FUNCTION reject_test_mention()",
+        )
+        .execute(&pool)
+        .await
+        .expect("install failure injection");
+
+        let mut tx = db
+            .begin_transaction()
+            .await
+            .expect("begin caller transaction");
+        let error = db
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                community,
+                &new,
+                &d_tag,
+                None,
+                replaceable::ParameterizedReplacePrecondition::Unconditional,
+            )
+            .await
+            .expect_err("mention failure must fail replacement");
+        assert!(error.to_string().contains("injected mention failure"));
+
+        let probe: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("inner failure must leave caller transaction usable");
+        assert_eq!(probe, 1);
+
+        let live_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_PROJECT as i32)
+        .bind(keys.public_key().to_bytes())
+        .bind(&d_tag)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("load live project after failed indexing");
+        assert_eq!(live_id, old.id.as_bytes().to_vec());
+        let new_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(new.id.as_bytes().as_slice())
+                .fetch_one(&mut *tx)
+                .await
+                .expect("count rolled-back project");
+        assert_eq!(new_rows, 0);
+        tx.commit().await.expect("commit usable caller transaction");
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn parameterized_duplicate_restores_live_head_inside_caller_transaction() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let keys = Keys::generate();
+        let d_tag = format!("duplicate-project-{}", Uuid::new_v4().simple());
+        let base = Timestamp::now().as_secs();
+        let event = |content: &str, timestamp: u64| {
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_PROJECT as u16), content)
+                .tags(vec![Tag::parse(["d", d_tag.as_str()]).expect("d tag")])
+                .custom_created_at(Timestamp::from(timestamp))
+                .sign_with_keys(&keys)
+                .expect("sign project")
+        };
+        let old = event("old-live-head", base);
+        let duplicate = event("soft-deleted-duplicate", base + 1);
+
+        assert!(
+            db.replace_parameterized_event(community, &duplicate, &d_tag, None)
+                .await
+                .expect("insert future duplicate")
+                .1
+        );
+        sqlx::query("UPDATE events SET deleted_at=NOW() WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid())
+            .bind(duplicate.id.as_bytes().as_slice())
+            .execute(&db.pool)
+            .await
+            .expect("soft-delete duplicate row");
+
+        let mut seed_tx = db
+            .begin_transaction()
+            .await
+            .expect("begin seed transaction");
+        let (_, was_inserted) =
+            event::insert_event_in_transaction(&mut seed_tx, community, &old, None)
+                .await
+                .expect("insert older live head");
+        assert!(was_inserted);
+        seed_tx.commit().await.expect("commit older live head");
+
+        let mut tx = db
+            .begin_transaction()
+            .await
+            .expect("begin caller transaction");
+        let result = db
+            .replace_parameterized_event_in_transaction(
+                &mut tx,
+                community,
+                &duplicate,
+                &d_tag,
+                None,
+                replaceable::ParameterizedReplacePrecondition::Unconditional,
+            )
+            .await
+            .expect("evaluate soft-deleted duplicate");
+        assert_eq!(
+            result.status,
+            replaceable::ParameterizedReplaceStatus::Duplicate
+        );
+
+        let live_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_PROJECT as i32)
+        .bind(keys.public_key().to_bytes())
+        .bind(&d_tag)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("caller transaction remains usable after duplicate");
+        assert_eq!(live_id, old.id.as_bytes().to_vec());
+        tx.rollback().await.expect("roll back caller transaction");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_parameterized_replacement_keeps_deterministic_head() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let keys = Keys::generate();
+        let d_tag = format!("concurrent-project-{}", Uuid::new_v4().simple());
+        let created_at = Timestamp::now().as_secs();
+        let event = |content: &str, timestamp: u64| {
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_PROJECT as u16), content)
+                .tags(vec![Tag::parse(["d", d_tag.as_str()]).expect("d tag")])
+                .custom_created_at(Timestamp::from(timestamp))
+                .sign_with_keys(&keys)
+                .expect("sign project")
+        };
+        let first = event("first", created_at);
+        let second = event("second", created_at);
+        let expected = if first.id.as_bytes() < second.id.as_bytes() {
+            &first
+        } else {
+            &second
+        };
+
+        let (first_result, second_result) = tokio::join!(
+            db.replace_parameterized_event(community, &first, &d_tag, None),
+            db.replace_parameterized_event(community, &second, &d_tag, None),
+        );
+        let first_inserted = first_result.expect("first concurrent writer").1;
+        let second_inserted = second_result.expect("second concurrent writer").1;
+        assert!(
+            first_inserted || second_inserted,
+            "at least one concurrent writer must insert",
+        );
+
+        let live_ids: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_PROJECT as i32)
+        .bind(keys.public_key().to_bytes())
+        .bind(&d_tag)
+        .fetch_all(&db.pool)
+        .await
+        .expect("load concurrent live head");
+        assert_eq!(live_ids, vec![expected.id.as_bytes().to_vec()]);
+
+        assert!(
+            !db.replace_parameterized_event(community, expected, &d_tag, None)
+                .await
+                .expect("replay winning event")
+                .1,
+            "replaying the live event must be idempotent",
+        );
+        let stale = event("stale", created_at.saturating_sub(1));
+        assert!(
+            !db.replace_parameterized_event(community, &stale, &d_tag, None)
+                .await
+                .expect("submit stale event")
+                .1,
+            "an older event must not replace the live head",
+        );
     }
 
     #[tokio::test]
@@ -6481,9 +7504,12 @@ mod tests {
         std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into())
     }
 
-    /// Create a fresh scratch database on the same server and run migrations.
-    /// Returns (pool, db_name); callers should `drop_scratch_db` when done.
-    async fn create_scratch_db(admin: &PgPool, prefix: &str) -> (PgPool, String) {
+    /// Create a fresh scratch database on the same server and optionally run migrations.
+    async fn create_scratch_db_through(
+        admin: &PgPool,
+        prefix: &str,
+        target: Option<i64>,
+    ) -> (PgPool, String) {
         let name = format!("{}_{}", prefix, Uuid::new_v4().simple());
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(admin)
@@ -6498,10 +7524,21 @@ mod tests {
         let pool = PgPool::connect(&scratch_url)
             .await
             .expect("connect scratch db");
-        migration::run_migrations(&pool)
-            .await
-            .expect("migrate scratch db");
+        match target {
+            Some(target) => migration::run_migrations_through(&pool, target)
+                .await
+                .expect("migrate scratch db through target"),
+            None => migration::run_migrations(&pool)
+                .await
+                .expect("migrate scratch db"),
+        }
         (pool, name)
+    }
+
+    /// Create a fresh scratch database on the same server and run all migrations.
+    /// Returns (pool, db_name); callers should `drop_scratch_db` when done.
+    async fn create_scratch_db(admin: &PgPool, prefix: &str) -> (PgPool, String) {
+        create_scratch_db_through(admin, prefix, None).await
     }
 
     async fn drop_scratch_db(admin: &PgPool, pool: PgPool, name: &str) {
@@ -8298,6 +9335,76 @@ mod tests {
         drop_scratch_db(&admin, pool, &name).await;
     }
 
+    #[test]
+    fn writer_pool_safety_hook_is_single_and_composed() {
+        let source = include_str!("lib.rs");
+        let connect_pool = source
+            .split("async fn connect_pool")
+            .nth(1)
+            .and_then(|tail| tail.split("const READER_ACQUIRE_TIMEOUT").next())
+            .expect("connect_pool source block");
+        assert_eq!(
+            connect_pool.matches(".after_connect(").count(),
+            1,
+            "SQLx replaces after_connect hooks; writer safety must use exactly one"
+        );
+        assert!(connect_pool.contains("buzz.created_at_floor"));
+        assert!(connect_pool.contains("SHOW transaction_isolation"));
+        assert!(!connect_pool.contains("arm_floor_guard"));
+        assert!(!connect_pool.contains("_arm_floor_guard"));
+        assert!(!connect_pool.contains("allow(unused_variables)"));
+
+        let reader_doc = source
+            .split("fn connect_read_pool")
+            .next()
+            .and_then(|prefix| prefix.rsplit("/// Connect the read-replica").next())
+            .expect("reader pool documentation");
+        assert!(reader_doc.contains("replica sessions are"));
+        assert!(reader_doc.contains("read-only"));
+        assert!(!reader_doc.contains("Db::connect_pool"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn writer_pool_rejects_non_read_committed_database_default() {
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (seed_pool, name) = create_scratch_db(&admin, "writer_isolation").await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER DATABASE {name} SET default_transaction_isolation = 'repeatable read'"
+        )))
+        .execute(&admin)
+        .await
+        .expect("set unsafe database default");
+        seed_pool.close().await;
+
+        let base = admin_url().await;
+        let idx = base.rfind('/').expect("db url has a path segment");
+        let scratch_url = format!("{}/{}", &base[..idx], name);
+        let error = Db::new(&DbConfig {
+            database_url: scratch_url,
+            max_connections: 1,
+            min_connections: 1,
+            acquire_timeout_secs: 1,
+            ..DbConfig::default()
+        })
+        .await
+        .expect_err("writer pool must reject pinned-snapshot database defaults");
+        assert!(
+            error.to_string().contains("requires READ COMMITTED")
+                || error.to_string().contains("pool timed out"),
+            "unexpected isolation rejection: {error}"
+        );
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop isolation test database");
+    }
+
     /// The armed writer pool (`Db::new`) must enforce the floor end-to-end
     /// through the public insert APIs, and the session GUC must be verifiably
     /// set on pooled connections.
@@ -8336,6 +9443,14 @@ mod tests {
             effective,
             crate::replica_fence::CREATED_AT_FLOOR_SECS.to_string(),
             "writer pool must arm the floor guard on every connection"
+        );
+        let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+            .fetch_one(&db.pool)
+            .await
+            .expect("SHOW writer isolation");
+        assert_eq!(
+            isolation, "read committed",
+            "the same writer after_connect hook must enforce the isolation premise"
         );
 
         let now_secs = chrono::Utc::now().timestamp() as u64;

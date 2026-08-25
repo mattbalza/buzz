@@ -32,6 +32,11 @@ import {
   updateChannel,
 } from "@/shared/api/tauri";
 
+// Adapter: resolves the full channel list without the not-modified short-circuit.
+// Onboarding paths run once and always need fresh data.
+const getChannelsList = (): Promise<Channel[]> =>
+  getChannels(null).then((payload) => payload.channels ?? []);
+
 const STARTER_CHANNEL_SETUP_TOAST_ID = "starter-channel-setup-error";
 
 export type ChannelInitResult =
@@ -83,14 +88,17 @@ export async function initializeStarterChannels(
     let starterChannels: Awaited<
       ReturnType<typeof ensureStarterChannels>
     > | null = null;
-    let starterChannelsError: unknown = null;
     try {
       starterChannels = await ensureStarterChannels({
         ensureStarterChannels: ensureStarterChannelsCommand,
-        getChannels,
+        getChannels: getChannelsList,
       });
     } catch (error) {
-      starterChannelsError = error;
+      // Public starter channels are optional. Owners may have deliberately
+      // deleted their deterministic starter channels; that must not strand a
+      // new member who still has somewhere to land. `finalize()` re-throws any
+      // `ok: false`, so reporting this failure to the caller would paint an
+      // error over a member who is fully provisioned.
       console.warn("Failed to initialize public starter channels.", error);
     }
 
@@ -100,7 +108,7 @@ export async function initializeStarterChannels(
           createChannel,
           deleteChannel,
           getChannelMembers,
-          getChannels,
+          getChannels: getChannelsList,
           updateChannel,
         },
         {
@@ -165,16 +173,6 @@ export async function initializeStarterChannels(
     const focusChannelId = focus
       ? resolveWelcomeFocusChannelId(welcomeChannel, starterChannels)
       : undefined;
-    if (starterChannelsError) {
-      return {
-        ok: false,
-        focusChannelId,
-        reason:
-          starterChannelsError instanceof Error
-            ? starterChannelsError.message
-            : "Failed to set up starter channels",
-      };
-    }
     return { ok: true, focusChannelId };
   } catch (error) {
     console.warn("Failed to initialize starter channels.", error);
@@ -192,7 +190,7 @@ async function refreshChannelsCache(
   queryClient: ReturnType<typeof useQueryClient>,
 ) {
   try {
-    queryClient.setQueryData(channelsQueryKey, await getChannels());
+    queryClient.setQueryData(channelsQueryKey, await getChannelsList());
   } catch {
     // The next mounted channels query can still retry; this cache refresh is
     // only here to avoid a blank Home flash after first-run setup.
