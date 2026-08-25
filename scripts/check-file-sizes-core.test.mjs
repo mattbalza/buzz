@@ -9,7 +9,9 @@ import {
   countLines,
   evaluateFileSize,
   parseChangedFiles,
+  parseMergeParents,
   resolveBaseRef,
+  resolveMergedInBaseRefs,
 } from "./check-file-sizes-core.mjs";
 
 function git(repo, ...args) {
@@ -97,6 +99,43 @@ test("parses modifications, deletions, and renames from Git's NUL format", () =>
       },
     ],
   );
+});
+
+test("reads the extra parents off `rev-list --merges --parents` lines", () => {
+  assert.deepEqual(parseMergeParents(""), []);
+  assert.deepEqual(parseMergeParents("merge first second\n"), ["second"]);
+  assert.deepEqual(
+    parseMergeParents("m1 p1 p2 p3\nm2 q1 q2\n"),
+    ["p2", "p3", "q2"],
+  );
+});
+
+test("an ingest merge donates its upstream parent as a base; a topic merge donates nothing", () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "file-size-merge-"));
+  git(repo, "init", "-b", "main");
+  git(repo, "config", "user.name", "Test");
+  git(repo, "config", "user.email", "test@example.com");
+  git(repo, "commit", "--allow-empty", "-m", "shared root");
+
+  // An outside history that never reached `main` — the upstream ingest case.
+  git(repo, "switch", "-c", "upstream");
+  git(repo, "commit", "--allow-empty", "-m", "upstream work");
+  const upstream = git(repo, "rev-parse", "HEAD");
+
+  // A branch already merged into `main` — the ordinary topic-branch case.
+  git(repo, "switch", "-c", "topic", "main");
+  git(repo, "commit", "--allow-empty", "-m", "topic work");
+  git(repo, "switch", "main");
+  git(repo, "merge", "--no-ff", "-m", "merge topic", "topic");
+  const base = git(repo, "rev-parse", "HEAD");
+
+  git(repo, "switch", "-c", "ingest");
+  git(repo, "merge", "--no-ff", "-m", "merge upstream", "upstream");
+
+  // Only the upstream side: the topic merge is already behind `base`, so its
+  // parent is reachable from it and contributes nothing.
+  assert.deepEqual(resolveMergedInBaseRefs(repo, base), [upstream]);
+  assert.deepEqual(resolveMergedInBaseRefs(repo, "HEAD"), []);
 });
 
 test("an inherited oversized file may hold or shrink but not grow", () => {

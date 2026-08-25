@@ -23,6 +23,7 @@ import {
   matchesInboxFilter,
 } from "@/features/home/lib/inboxViewHelpers";
 import { resolveInboxFilterSelection } from "@/features/home/lib/inboxSelection";
+import { INBOX_SEARCH_KEYS } from "@/features/home/lib/inboxSearchKeys";
 import { useHomeInboxReadState } from "@/features/home/useHomeInboxReadState";
 import { useHomeInboxAutoSelection } from "@/features/home/useHomeInboxAutoSelection";
 import { useHomeInboxContextMessages } from "@/features/home/useHomeInboxContextMessages";
@@ -74,13 +75,6 @@ import { useHistorySearchState } from "@/shared/hooks/useHistorySearchState";
 import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
 import { Button } from "@/shared/ui/button";
 import { HomeMembersSidebarOverlay } from "./HomeMembersSidebarOverlay";
-
-const INBOX_SEARCH_KEYS = [
-  "item",
-  "profile",
-  "profileTab",
-  "profileView",
-] as const;
 
 type HomeViewProps = {
   feed?: HomeFeedResponse;

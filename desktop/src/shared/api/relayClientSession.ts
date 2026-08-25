@@ -581,31 +581,7 @@ export class RelayClient {
       }, BACKOFF_RESET_STABLE_MS);
 
       this.connectionStateEmitter.set("connected");
-      // Detached on purpose. `connected` is emitted on the line above, so
-      // replay is not part of "am I connected" — but the reconnect controller
-      // wraps `preconnect()` in an 11 s deadline
-      // (`relayReconnectController.fastPathTimeoutMs`), and paced replay of a
-      // heavy-membership account (44+ channels, more than one live sub each)
-      // takes longer than that by design. Awaiting it here made the deadline
-      // kill sockets that were perfectly healthy, on every single reconnect:
-      // one staff pubkey opened 542 connections in 6 h with a median lifetime
-      // of 11.3 s and a maximum of 20.6 s, and `BACKOFF_RESET_STABLE_MS`
-      // (60 s) meant the backoff never reset either.
-      //
-      // Failures still tear the connection down — `replayLiveSubscriptions`
-      // calls `resetConnection` itself before rethrowing — and the generation
-      // guard inside makes a superseded replay a no-op. The watchdog and the
-      // reconnect notification stay behind replay, exactly where they were.
-      void this.replayLiveSubscriptions()
-        .then(() => {
-          if (generation !== this.connectionGeneration) return;
-          this.stallWatchdog.start();
-          this.emitReconnectIfNeeded();
-        })
-        .catch(() => {
-          // Already normalized, reported and reset inside. Catching only stops
-          // the rejection from surfacing as an unhandled promise.
-        });
+      this.startSubscriptionReplay(generation);
     } catch (error) {
       const connectionError = this.normalizeRelayError(
         error,
@@ -952,25 +928,29 @@ export class RelayClient {
     return [...this.subscriptions.values()].some((s) => s.mode === "live");
   }
 
-  private async replayLiveSubscriptions() {
-    const generation = this.connectionGeneration;
-    try {
-      await replayLiveSubscriptions({
-        subscriptions: this.subscriptions,
-        sendRaw: (payload) => this.sendRaw(payload),
-        requestRepair: getChannelReconnectRepairEvents,
-        generation,
-        visibleChannelId: this.visibleChannelId,
-        isActive: () => this.connectionGeneration === generation,
-      });
-    } catch (error) {
-      const reconnectError =
-        error instanceof Error
-          ? error
-          : new Error("Failed to restore relay subscriptions.");
-      this.resetConnection(reconnectError);
-      throw reconnectError;
-    }
+  /**
+   * Restore live subscriptions — detached from `connect()`: awaiting it there
+   * put budget-paced replay inside `relayReconnectController`'s 11 s
+   * `fastPathTimeoutMs`, which then killed healthy sockets on every reconnect
+   * (542 connections in 6 h, 11.3 s median, for one 40+-channel pubkey).
+   */
+  private startSubscriptionReplay(generation: number) {
+    void replayLiveSubscriptions({
+      subscriptions: this.subscriptions,
+      sendRaw: (payload) => this.sendRaw(payload),
+      requestRepair: getChannelReconnectRepairEvents,
+      generation,
+      visibleChannelId: this.visibleChannelId,
+      isActive: () => this.connectionGeneration === generation,
+    })
+      .then(() => {
+        if (generation !== this.connectionGeneration) return;
+        this.stallWatchdog.start();
+        this.emitReconnectIfNeeded();
+      })
+      .catch((error) =>
+        this.recoverFromSocketFailure(error, "Failed to restore relay subs."),
+      );
   }
 
   private scheduleReconnect() {
