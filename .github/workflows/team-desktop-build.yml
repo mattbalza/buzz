@@ -1,0 +1,168 @@
+name: Team Desktop Build
+
+# Installers for the Scalarly team.
+#
+# `release.yml` cannot serve this fork: every job is gated on
+# `github.repository == 'block/buzz'`, and its macOS jobs sign and notarize
+# through `block/apple-codesign-action` against Block's Apple account. We have
+# neither, so these builds are UNSIGNED — the same posture upstream already
+# ships for Windows (`_alpha-unsigned`), extended to macOS.
+#
+# The base `tauri.conf.json` is used deliberately: it leaves the updater with no
+# endpoints, so no updater keypair is needed and no half-configured auto-update
+# path ships. Every upgrade is a manual reinstall until we stand up our own
+# updater endpoint.
+#
+# `--features mesh-llm` is omitted on all three platforms. It builds llama.cpp
+# from source for on-device inference; our agents run over the relay through
+# ACP, so nobody is served by the extra half hour of build time.
+
+concurrency:
+  group: team-desktop-build-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS (${{ matrix.label }})
+    runs-on: macos-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Apple Silicon
+            target: aarch64-apple-darwin
+            slug: macos-arm64
+          - label: Intel
+            target: x86_64-apple-darwin
+            slug: macos-x64
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+
+      - name: Add Rust target
+        run: rustup target add "$TARGET"
+
+      - name: Build sidecars
+        run: |
+          cargo build --release --target "$TARGET" \
+            -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes \
+            -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Build app
+        run: cd desktop && pnpm tauri build --verbose --no-sign --target "$TARGET"
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+
+      # An unsigned .app will not launch on Apple Silicon at all — the kernel
+      # requires *a* signature, valid team or not. Ad-hoc signing supplies one,
+      # which is why the DMG is rebuilt from the signed bundle rather than
+      # shipped as the bundler left it. Gatekeeper still quarantines it; the
+      # install note tells the team how to clear that.
+      - name: Ad-hoc sign and rebuild the DMG
+        env:
+          SLUG: ${{ matrix.slug }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="desktop/src-tauri/target/${TARGET}/release/bundle"
+          APP="${BUNDLE_DIR}/macos/Buzz.app"
+          [[ -d "$APP" ]] || { echo "::error::No Buzz.app in ${BUNDLE_DIR}/macos"; exit 1; }
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+          VERSION=$(node -p "require('./desktop/package.json').version")
+          OUT="${RUNNER_TEMP}/Buzz_${VERSION}_${SLUG}_unsigned.dmg"
+          STAGE="${RUNNER_TEMP}/dmg-stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/Buzz.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Buzz" -srcfolder "$STAGE" -ov -format UDZO "$OUT"
+          echo "dmg=$OUT" >> "$GITHUB_ENV"
+
+      - name: Stage installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-desktop-${{ matrix.slug }}
+          if-no-files-found: error
+          path: ${{ env.dmg }}
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.14.1
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.4.0
+
+      - name: Install desktop dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Build sidecars
+        shell: bash
+        run: |
+          cargo build --release --target "$TARGET" \
+            -p buzz-acp -p buzz-agent -p buzz-dev-mcp \
+            -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Build NSIS installer
+        shell: bash
+        run: cd desktop && pnpm tauri build --verbose --target "$TARGET" --bundles nsis
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+      - name: Locate installer
+        id: installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="desktop/src-tauri/target/${TARGET}/release/bundle"
+          EXE=$(find "$BUNDLE_DIR/nsis" -name '*.exe' -type f | head -1)
+          [[ -n "$EXE" ]] || { echo "::error::No NSIS installer in $BUNDLE_DIR/nsis"; exit 1; }
+          # Same marker upstream's own Windows job uses, so nobody mistakes this
+          # for a signed build when it lands next to one.
+          MARKED="$(dirname "$EXE")/$(basename "$EXE" .exe)_unsigned.exe"
+          mv "$EXE" "$MARKED"
+          echo "exe=$MARKED" >> "$GITHUB_OUTPUT"
+
+      - name: Stage installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-desktop-windows-x64
+          if-no-files-found: error
+          path: ${{ steps.installer.outputs.exe }}
