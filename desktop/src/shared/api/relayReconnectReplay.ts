@@ -56,10 +56,22 @@ export const REPLAY_BATCH_SIZE = 8;
 /**
  * Delay between consecutive replay batches (milliseconds).
  *
- * Spreads the REQ storm across time so the relay's sliding quota window
- * can absorb each batch without triggering rate-limiting on the next.
+ * Sized against the relay's actual budget, which is a FIXED window, not the
+ * sliding one this comment used to claim: `ws_admission_budget` turns
+ * `human_ws_events_per_sec` into `rate * 5` frames per 5-second window
+ * (`crates/buzz-auth/src/rate_limit.rs`), and every REQ, EVENT and COUNT
+ * frame spends from it. At the previous 50 ms this loop offered ~160 REQ/s
+ * against a default of 10/s — a batch delay small enough to fit inside one
+ * window spreads nothing, it just arrives together.
+ *
+ * One batch per second keeps sustained demand at `REPLAY_BATCH_SIZE`/s, under
+ * the default budget with room for the EVENTs a live session sends alongside.
+ * Replay is no longer on the connect path (see `relayClientSession.connect`),
+ * so the resulting ~11 s for a 90-subscription account costs nothing but the
+ * order in which channels finish catching up — and the visible channel is
+ * sorted into the first batch.
  */
-export const REPLAY_INTER_BATCH_DELAY_MS = 50;
+export const REPLAY_INTER_BATCH_DELAY_MS = 1_000;
 
 async function runWithConcurrency<T>(
   items: T[],

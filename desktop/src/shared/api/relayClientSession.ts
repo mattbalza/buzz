@@ -581,9 +581,31 @@ export class RelayClient {
       }, BACKOFF_RESET_STABLE_MS);
 
       this.connectionStateEmitter.set("connected");
-      await this.replayLiveSubscriptions();
-      this.stallWatchdog.start();
-      this.emitReconnectIfNeeded();
+      // Detached on purpose. `connected` is emitted on the line above, so
+      // replay is not part of "am I connected" — but the reconnect controller
+      // wraps `preconnect()` in an 11 s deadline
+      // (`relayReconnectController.fastPathTimeoutMs`), and paced replay of a
+      // heavy-membership account (44+ channels, more than one live sub each)
+      // takes longer than that by design. Awaiting it here made the deadline
+      // kill sockets that were perfectly healthy, on every single reconnect:
+      // one staff pubkey opened 542 connections in 6 h with a median lifetime
+      // of 11.3 s and a maximum of 20.6 s, and `BACKOFF_RESET_STABLE_MS`
+      // (60 s) meant the backoff never reset either.
+      //
+      // Failures still tear the connection down — `replayLiveSubscriptions`
+      // calls `resetConnection` itself before rethrowing — and the generation
+      // guard inside makes a superseded replay a no-op. The watchdog and the
+      // reconnect notification stay behind replay, exactly where they were.
+      void this.replayLiveSubscriptions()
+        .then(() => {
+          if (generation !== this.connectionGeneration) return;
+          this.stallWatchdog.start();
+          this.emitReconnectIfNeeded();
+        })
+        .catch(() => {
+          // Already normalized, reported and reset inside. Catching only stops
+          // the rejection from surfacing as an unhandled promise.
+        });
     } catch (error) {
       const connectionError = this.normalizeRelayError(
         error,
