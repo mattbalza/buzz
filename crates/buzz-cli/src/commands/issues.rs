@@ -5,8 +5,8 @@ use crate::commands::with_git_provenance;
 use crate::error::CliError;
 use crate::validate::{read_or_stdin, sdk_err, validate_hex64, validate_repo_id};
 use buzz_sdk::{GitIssueMeta, GitRepoCoord, GitStatusMeta};
-use nostr::{Event, EventBuilder, Tag};
 use nostr::Timestamp;
+use nostr::{Event, EventBuilder, Tag};
 use serde::Deserialize;
 
 const ISSUE_ASSIGNMENT_LABEL: &str = "assignment";

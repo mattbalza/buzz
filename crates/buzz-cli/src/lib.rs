@@ -2505,13 +2505,7 @@ mod tests {
             vec![
                 "assign",
                 // fork-only: `comment` and `rm` have no upstream equivalent.
-                "comment",
-                "create",
-                "get",
-                "list",
-                "rm",
-                "status",
-                "unassign",
+                "comment", "create", "get", "list", "rm", "status", "unassign",
             ]
         );
         assert_eq!(names(&cmd, "media"), vec!["get"]);

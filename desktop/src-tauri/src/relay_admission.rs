@@ -42,10 +42,6 @@ pub const MAX_HINT_SECONDS: u64 = 300;
 
 static GATE_EXPIRY: Mutex<Option<Instant>> = Mutex::new(None);
 
-// The gate is process-wide, so every test that can arm it must serialize.
-#[cfg(test)]
-pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Arm (or extend) the admission gate from a relay 429.
 ///
 /// `retry_in_seconds` is the parsed `retry in Ns` hint, if the relay provided

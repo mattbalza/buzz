@@ -446,6 +446,7 @@ async fn a_recreated_subscription_is_not_suppressed_when_the_writes_coalesce() {
 /// just rejected us, at the speed of the event loop.
 #[tokio::test]
 async fn a_reconcile_preserves_the_backoff_of_a_still_desired_subscription() {
+    let _gate = crate::relay_admission::test_support::lock_gate().await;
     let (relay_url, mut frames, closed) = stub_relay().await;
     let (session, _events) = start(relay_url, Keys::generate(), None).await;
 
@@ -487,7 +488,6 @@ async fn a_reconcile_preserves_the_backoff_of_a_still_desired_subscription() {
          reconcile, got {reopened:?}"
     );
 
-    crate::relay_admission::reset_rate_limit_gate();
     session.shutdown();
 }
 
@@ -714,8 +714,13 @@ fn retry_delay_grows_and_stops_at_the_ceiling() {
     );
 }
 
-#[test]
-fn a_rate_limited_closed_waits_at_least_the_relay_hint() {
+// `ClosedRetry::schedule` arms the process-wide admission gate on a
+// rate-limited message, so these two take the gate guard rather than only
+// clearing up after themselves: an unserialized arming is what makes an
+// unrelated test inherit a window it never set.
+#[tokio::test]
+async fn a_rate_limited_closed_waits_at_least_the_relay_hint() {
+    let _gate = crate::relay_admission::test_support::lock_gate().await;
     let mut retry = ClosedRetry::default();
     retry.schedule("rate-limited: quota exceeded; retry in 12s");
 
@@ -726,11 +731,11 @@ fn a_rate_limited_closed_waits_at_least_the_relay_hint() {
         due >= Instant::now() + Duration::from_secs(11),
         "a 12s hint must not be undercut by the base backoff"
     );
-    crate::relay_admission::reset_rate_limit_gate();
 }
 
-#[test]
-fn a_hintless_rate_limited_closed_uses_the_shared_default() {
+#[tokio::test]
+async fn a_hintless_rate_limited_closed_uses_the_shared_default() {
+    let _gate = crate::relay_admission::test_support::lock_gate().await;
     let mut retry = ClosedRetry::default();
     retry.schedule("rate-limited: quota exceeded");
 
@@ -739,7 +744,6 @@ fn a_hintless_rate_limited_closed_uses_the_shared_default() {
         due >= Instant::now() + CLOSED_RATE_LIMIT_DEFAULT - Duration::from_secs(1),
         "a hintless rate-limit must fall back to the shared default window"
     );
-    crate::relay_admission::reset_rate_limit_gate();
 }
 
 #[test]

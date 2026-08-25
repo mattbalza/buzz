@@ -1125,7 +1125,9 @@ test("clicking past the end of a mention chip puts the caret outside the handle"
   await page.keyboard.type("tail");
   await expect(input).toHaveText("Hey @bob tail");
 
-  const chip = input.locator(".mention-chip", { hasText: "@bob" });
+  // The `@` is its own `mention-prefix-hidden` decoration, so the chip covers
+  // the handle only — the icon in its left padding stands in for the sigil.
+  const chip = input.locator(".mention-chip", { hasText: "bob" });
   const geometry = await chip.evaluate((el) => {
     const glyphs = document.createRange();
     glyphs.selectNodeContents(el.firstChild as Node);
@@ -1178,7 +1180,7 @@ test("clicking past the end of a mention chip puts the caret outside the handle"
 
   await page.keyboard.type("Z");
   await expect(input).toHaveText("Hey @bob Ztail");
-  await expect(chip).toHaveText("@bob");
+  await expect(chip).toHaveText("bob");
 });
 
 test("selecting a managed agent mention inserts @Name into input", async ({

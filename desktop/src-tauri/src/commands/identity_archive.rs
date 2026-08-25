@@ -657,11 +657,10 @@ mod tests {
     #[tokio::test]
     async fn archived_fetch_never_crosses_relays_mid_flight() {
         use crate::app_state::build_app_state;
-        use crate::relay_admission::{reset_rate_limit_gate, TEST_SERIAL};
+        use crate::relay_admission::test_support;
         use axum::{routing::get, routing::post, Json, Router};
 
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
 
         // Build a loopback relay that advertises `relay_keys` as its NIP-11
         // `self` and serves a relay-signed 13535 snapshot archiving `archived`.
@@ -724,7 +723,6 @@ mod tests {
             "signer and snapshot must both come from the captured relay A, \
              never the mutated override (relay B)"
         );
-        reset_rate_limit_gate();
     }
 
     /// Spawn a loopback `/events` relay that answers every submit with the
@@ -772,10 +770,9 @@ mod tests {
     #[tokio::test]
     async fn archive_core_fires_regen_only_on_accepted_submit() {
         use crate::app_state::build_app_state;
-        use crate::relay_admission::{reset_rate_limit_gate, TEST_SERIAL};
+        use crate::relay_admission::test_support;
 
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
 
         let state = build_app_state();
         let req = ArchiveRequest {
@@ -808,8 +805,6 @@ mod tests {
             0,
             "a rejected archive changed nothing, so regeneration must not fire"
         );
-
-        reset_rate_limit_gate();
     }
 
     /// Regression for item 1, unarchive site: mirrors
@@ -822,10 +817,9 @@ mod tests {
     #[tokio::test]
     async fn unarchive_core_fires_regen_only_on_accepted_submit() {
         use crate::app_state::build_app_state;
-        use crate::relay_admission::{reset_rate_limit_gate, TEST_SERIAL};
+        use crate::relay_admission::test_support;
 
-        let _serial = TEST_SERIAL.lock().await;
-        reset_rate_limit_gate();
+        let _gate = test_support::lock_gate().await;
 
         let state = build_app_state();
         let req = UnarchiveRequest {
@@ -857,7 +851,5 @@ mod tests {
             0,
             "a rejected unarchive changed nothing, so regeneration must not fire"
         );
-
-        reset_rate_limit_gate();
     }
 }
